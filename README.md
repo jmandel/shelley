@@ -17,7 +17,7 @@ bring your own.
 
 Shelley also supports subagents: child conversations spawned via the `subagent`
 tool to run focused tasks in parallel, each with its own conversation thread
-and UI link back to the parent.
+and UI link back to the parent. See [SUBAGENTS.md](SUBAGENTS.md) for details.
 
 # Installation
 

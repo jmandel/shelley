@@ -87,7 +87,7 @@ The UI renders subagent tool output with a dedicated component and provides a
 "View subagent conversation" link. The conversation drawer groups subagent
 threads under their parent using `/conversation/<id>/subagents`.
 
-#### Evolution over the past week
+#### Recent evolution
 
 - Added parent conversation tracking (parent_conversation_id) and API endpoints
   to enumerate a conversation's subagents.
