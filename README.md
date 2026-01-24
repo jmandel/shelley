@@ -53,7 +53,13 @@ and React for the UI.
 
 The data model is that Conversations have Messages, which might be from the
 user, the model, the tools, or the harness. All of that is stored in the
-database, and we use a SSE endpoint to keep the UI updated. 
+database, and we use a SSE endpoint to keep the UI updated.
+
+For more detailed documentation, see:
+- [ARCHITECTURE.md](ARCHITECTURE.md) - System architecture overview
+- [AGENTS.md](AGENTS.md) - Agent development guidelines
+- [SUBAGENTS.md](SUBAGENTS.md) - Sub-agent feature documentation
+- [AGENT_TESTING.md](AGENT_TESTING.md) - Testing guide 
 
 # History
 
