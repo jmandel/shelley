@@ -68,5 +68,6 @@ work.
 This behavior is true in the current implementation because the subagent runner
 explicitly cancels before queuing new work. If the initial subagent release did
 not include this cancellation step, we should update this section with the
-specific version or change that introduced it; the current code does not retain
-that historical marker.
+specific version or change that introduced it. In this checkout the git history
+is shallow (grafted), so earlier commits are not available to pinpoint the
+introduction; reviewing the full repository history will be required.
