@@ -20,9 +20,11 @@ Infrastructure:
 
 ### db/
 
-conversation(conversation_id, slug, user_initiated):
-  
-  Represents a single conversation.
+conversation(conversation_id, slug, user_initiated, parent_conversation_id):
+
+  Represents a single conversation. Top-level chats are user_initiated=true with
+  parent_conversation_id NULL. Subagent/tool conversations set user_initiated=false
+  and reference their parent conversation.
 
 message(conversation_id, message_id, type (agent/user/tool), llm_data (json), user_data (json), usage (json))
 
@@ -32,7 +34,8 @@ message(conversation_id, message_id, type (agent/user/tool), llm_data (json), us
 
 The database is sqlite. We use sqlc to define queries and schema.
 
-TODOX: Subagent/tool conversations are done with user_initiated=false.
+Subagent/tool conversations are done with user_initiated=false and use
+parent_conversation_id to connect to their parent chat.
 
 ### server/
 
@@ -63,6 +66,38 @@ When a conversation is active (because it's had a message sent to it, or there
 are stream subscribers), a Conversation struct is instantiated from the data,
 and the server keeps a map of these. Each of these has a Loop struct to keep
 track of the interaction with the llm.
+
+### Subagents
+
+Subagents are child conversations spawned via the `subagent` tool. Each subagent
+gets a slug that is unique within the parent conversation, shares the parent
+working directory, and persists as its own conversation thread with a minimal
+system prompt. The server stores the relationship with
+parent_conversation_id and keeps these out of the top-level list by setting
+user_initiated=false.
+
+Subagent execution is managed by the server's SubagentRunner. It injects a user
+message into the subagent conversation, then either waits for completion or
+returns immediately when `wait=false` is set. While waiting, it polls the
+subagent's working state with a timeout; when the timeout is reached it produces
+a short LLM-generated progress summary. Nested subagents are disabled by the
+subagent toolset configuration.
+
+The UI renders subagent tool output with a dedicated component and provides a
+"View subagent conversation" link. The conversation drawer groups subagent
+threads under their parent using `/conversation/<id>/subagents`.
+
+#### Evolution over the past week
+
+- Added parent conversation tracking (parent_conversation_id) and API endpoints
+  to enumerate a conversation's subagents.
+- Introduced the SubagentRunner flow that handles waiting, cancellation, and
+  timeout-based progress summaries.
+- Expanded the tool schema to support `timeout_seconds` and fire-and-forget
+  execution via `wait=false`.
+- Added UI rendering and navigation for subagent threads, plus grouping in the
+  conversation drawer.
+- Locked down nested subagents by omitting SubagentRunner from subagent toolsets.
 
 ## loop/
 

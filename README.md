@@ -15,6 +15,10 @@ bring your own.
 
 *Single-user* because it makes sense to bring the agent to the compute.
 
+Shelley also supports subagents: child conversations spawned via the `subagent`
+tool to run focused tasks in parallel, each with its own conversation thread
+and UI link back to the parent.
+
 # Installation
 
 ## Pre-Built Binaries (macOS/Linux)
@@ -86,4 +90,3 @@ run
 ```
 socat TCP-LISTEN:9001,fork TCP:localhost:9000
 ```
-
