@@ -65,7 +65,8 @@ the new message. This interrupt behavior is part of the current implementation
 and ensures the latest parent request takes precedence over in-flight subagent
 work.
 
-This behavior has not changed in the current implementation: the cancellation
-step is still executed before the new subagent prompt is queued. If the desired
-behavior changes in the future (e.g., allowing concurrent subagent runs), this
-section should be updated along with `server/subagent.go`.
+This behavior is true in the current implementation because the subagent runner
+explicitly cancels before queuing new work. If the initial subagent release did
+not include this cancellation step, we should update this section with the
+specific version or change that introduced it; the current code does not retain
+that historical marker.
