@@ -59,7 +59,7 @@ For more detailed documentation, see:
 - [ARCHITECTURE.md](ARCHITECTURE.md) - System architecture overview
 - [AGENTS.md](AGENTS.md) - Agent development guidelines
 - [SUBAGENTS.md](SUBAGENTS.md) - Sub-agent feature documentation
-- [AGENT_TESTING.md](AGENT_TESTING.md) - Testing guide 
+- [AGENT_TESTING.md](AGENT_TESTING.md) - Testing guide
 
 # History
 
