@@ -46,6 +46,17 @@ make
 New releases are automatically created on every commit to `main`. Versions
 follow the pattern `v0.N.9OCTAL` where N is the total commit count and 9OCTAL is the commit SHA encoded as octal (prefixed with 9).
 
+# Features
+
+## Agent Skills
+
+Shelley supports the [Agent Skills](https://agentskills.io) open specification, allowing you to extend the agent's capabilities with custom skills packaged as SKILL.md files. Skills are automatically discovered from:
+
+- `~/.config/shelley/` (user-level skills)
+- Your project repository (project-level skills)
+
+See [SKILLS.md](./SKILLS.md) for complete documentation on creating and using skills.
+
 # Architecture 
 
 The technical stack is Go for the backend, SQLite for storage, and Typescript
