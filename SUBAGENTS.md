@@ -28,6 +28,9 @@ At launch, the subagent feature provided:
 
 - **Unique slugs per parent** so multiple subagents could run in parallel.
 - **Message injection** into the subagent conversation to start work.
+- **Parent messages interrupt in-flight work**: when a parent sends another
+  message to the same subagent, the server cancels the subagent's current loop
+  before queueing the new message.
 - **Blocking completion**: the parent agent could wait for the subagent's last
   response and surface it as tool output.
 - **Persistence**: subagent conversations were stored and retrievable like any
@@ -53,3 +56,16 @@ Subagent functionality has expanded beyond the initial design:
 Together these changes turned subagents from a basic delegation primitive into a
 fully surfaced workflow for parallel tasks, richer status reporting, and clearer
 navigation across parent and child conversations.
+
+## Parent-to-Subagent Interruptions
+
+Yes. When a parent conversation sends another message to the same subagent, the
+server checks `IsAgentWorking()` and calls `CancelConversation()` before accepting
+the new message. This interrupt behavior is part of the current implementation
+and ensures the latest parent request takes precedence over in-flight subagent
+work.
+
+This behavior has not changed in the current implementation: the cancellation
+step is still executed before the new subagent prompt is queued. If the desired
+behavior changes in the future (e.g., allowing concurrent subagent runs), this
+section should be updated along with `server/subagent.go`.
