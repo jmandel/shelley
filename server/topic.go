@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -30,6 +31,10 @@ type Topic struct {
 
 	turnMu   sync.Mutex
 	turnDone chan struct{}
+
+	metaMu    sync.Mutex
+	promptSeq int64
+	eventSeq  int64
 
 	approvalMu       sync.Mutex
 	pendingApprovals map[string]chan workspaceApprovalResponse
@@ -187,20 +192,45 @@ func (t *Topic) IsBusy() bool {
 	t.turnMu.Lock()
 	turnActive := t.turnDone != nil
 	t.turnMu.Unlock()
-	return turnActive || t.Manager.IsAgentWorking() || t.PromptQueue.Len() > 0
+	return turnActive || t.Manager.IsAgentWorking() || t.PromptQueue.Len() > 0 || t.PromptQueue.ActivePromptID() != ""
 }
 
-func (t *Topic) EnqueuePrompt(text, senderID string) bool {
+func (t *Topic) EnqueuePrompt(promptID, text, senderID string) QueuedPrompt {
+	if promptID == "" {
+		promptID = t.nextPromptID()
+	}
 	queued := t.IsBusy()
-	t.PromptQueue.Enqueue(QueuedPrompt{
+	prompt := QueuedPrompt{
+		PromptID: promptID,
 		Text:     text,
 		SenderID: senderID,
-		QueuedAt: time.Now(),
+		QueuedAt: time.Now().UTC(),
+	}
+	position := t.PromptQueue.Enqueue(prompt)
+	t.broadcastQueueEvent(workspaceWSMessage{
+		Type:     "prompt_status",
+		PromptID: prompt.PromptID,
+		Status:   string(PromptStatusAccepted),
+		Position: position,
+		SubmittedBy: &workspaceSubjectRef{
+			Kind: "participant",
+			ID:   prompt.SenderID,
+		},
 	})
 	if queued {
-		t.WSHub.Broadcast(workspaceWSMessage{Type: "system", Data: "queued prompt"})
+		t.broadcastQueueEvent(workspaceWSMessage{
+			Type:     "prompt_status",
+			PromptID: prompt.PromptID,
+			Status:   string(PromptStatusQueued),
+			Position: position,
+			SubmittedBy: &workspaceSubjectRef{
+				Kind: "participant",
+				ID:   prompt.SenderID,
+			},
+		})
 	}
-	return queued
+	t.broadcastQueueSnapshot()
+	return prompt
 }
 
 func (t *Topic) forwardStream() {
@@ -221,6 +251,9 @@ func (t *Topic) forwardStream() {
 
 		messages, turnComplete := translateWorkspaceWSMessages(toolTitles, streamData)
 		for _, msg := range messages {
+			if msg.PromptID == "" {
+				msg.PromptID = t.PromptQueue.ActivePromptID()
+			}
 			t.WSHub.Broadcast(msg)
 		}
 		if turnComplete || (streamData.ConversationState != nil && !streamData.ConversationState.Working) {
@@ -237,13 +270,23 @@ func (t *Topic) drainPrompts() {
 		}
 
 		waitCh := t.beginTurn()
+		t.broadcastQueueEvent(workspaceWSMessage{
+			Type:     "prompt_status",
+			PromptID: prompt.PromptID,
+			Status:   string(PromptStatusStarted),
+			SubmittedBy: &workspaceSubjectRef{
+				Kind: "participant",
+				ID:   prompt.SenderID,
+			},
+		})
+		t.broadcastQueueSnapshot()
 		if err := t.refreshWorkspaceTools(t.runtimeCtx); err != nil {
 			t.abortTurn()
 			t.WSHub.Broadcast(workspaceWSMessage{Type: "error", Data: err.Error()})
 			continue
 		}
 
-		t.WSHub.Broadcast(workspaceWSMessage{Type: "system", Data: "thinking..."})
+		t.WSHub.Broadcast(workspaceWSMessage{Type: "system", Data: "thinking...", PromptID: prompt.PromptID})
 
 		modelID := conversationModelID(*t.Conversation, t.Config.ModelID)
 		llmService, err := t.server.llmManager.GetService(modelID)
@@ -272,6 +315,79 @@ func (t *Topic) drainPrompts() {
 	}
 }
 
+func (t *Topic) QueueSnapshot() workspaceQueueSnapshot {
+	snapshot := t.PromptQueue.Snapshot()
+	resp := workspaceQueueSnapshot{
+		SessionID:      t.Conversation.ConversationID,
+		ActivePromptID: t.PromptQueue.ActivePromptID(),
+		Entries:        make([]workspaceQueueEntry, 0, len(snapshot.Entries)),
+	}
+	for i, prompt := range snapshot.Entries {
+		resp.Entries = append(resp.Entries, workspaceQueueEntry{
+			PromptID:  prompt.PromptID,
+			Status:    string(prompt.Status),
+			Text:      prompt.Text,
+			CreatedAt: prompt.QueuedAt.Format(time.RFC3339),
+			Position:  i + 1,
+			SubmittedBy: workspaceSubjectRef{
+				Kind: "participant",
+				ID:   prompt.SenderID,
+			},
+		})
+	}
+	return resp
+}
+
+func (t *Topic) CancelQueuedPrompt(promptID, senderID string) error {
+	removed, _, err := t.PromptQueue.Cancel(promptID, senderID)
+	if err != nil {
+		return err
+	}
+	t.broadcastQueueEvent(workspaceWSMessage{
+		Type:     "prompt_status",
+		PromptID: removed.PromptID,
+		Status:   string(PromptStatusCancelled),
+		SubmittedBy: &workspaceSubjectRef{
+			Kind: "participant",
+			ID:   removed.SenderID,
+		},
+	})
+	t.broadcastQueueEvent(workspaceWSMessage{
+		Type:     "queue_entry_removed",
+		PromptID: removed.PromptID,
+		Reason:   "cancelled_by_submitter",
+	})
+	t.broadcastQueueSnapshot()
+	return nil
+}
+
+func (t *Topic) ClearQueuedPromptsForSender(senderID string) []string {
+	removed := t.PromptQueue.CancelMine(senderID)
+	if len(removed) == 0 {
+		return nil
+	}
+	removedIDs := make([]string, 0, len(removed))
+	for _, prompt := range removed {
+		removedIDs = append(removedIDs, prompt.PromptID)
+		t.broadcastQueueEvent(workspaceWSMessage{
+			Type:     "prompt_status",
+			PromptID: prompt.PromptID,
+			Status:   string(PromptStatusCancelled),
+			SubmittedBy: &workspaceSubjectRef{
+				Kind: "participant",
+				ID:   prompt.SenderID,
+			},
+		})
+		t.broadcastQueueEvent(workspaceWSMessage{
+			Type:     "queue_entry_removed",
+			PromptID: prompt.PromptID,
+			Reason:   "cancelled_by_submitter",
+		})
+	}
+	t.broadcastQueueSnapshot()
+	return removedIDs
+}
+
 func (t *Topic) refreshWorkspaceTools(ctx context.Context) error {
 	workspaceTools, err := t.server.buildTopicWorkspaceTools(ctx, t.Name)
 	if err != nil {
@@ -290,6 +406,18 @@ func (t *Topic) beginTurn() <-chan struct{} {
 }
 
 func (t *Topic) completeTurn() {
+	if completed, ok := t.PromptQueue.CompleteActive(PromptStatusCompleted); ok {
+		t.broadcastQueueEvent(workspaceWSMessage{
+			Type:     "prompt_status",
+			PromptID: completed.PromptID,
+			Status:   string(PromptStatusCompleted),
+			SubmittedBy: &workspaceSubjectRef{
+				Kind: "participant",
+				ID:   completed.SenderID,
+			},
+		})
+		t.broadcastQueueSnapshot()
+	}
 	t.turnMu.Lock()
 	defer t.turnMu.Unlock()
 	if t.turnDone != nil {
@@ -299,6 +427,18 @@ func (t *Topic) completeTurn() {
 }
 
 func (t *Topic) abortTurn() {
+	if failed, ok := t.PromptQueue.CompleteActive(PromptStatusFailed); ok {
+		t.broadcastQueueEvent(workspaceWSMessage{
+			Type:     "prompt_status",
+			PromptID: failed.PromptID,
+			Status:   string(PromptStatusFailed),
+			SubmittedBy: &workspaceSubjectRef{
+				Kind: "participant",
+				ID:   failed.SenderID,
+			},
+		})
+		t.broadcastQueueSnapshot()
+	}
 	t.turnMu.Lock()
 	defer t.turnMu.Unlock()
 	if t.turnDone != nil {
@@ -314,4 +454,36 @@ func (t *Topic) waitForTurnEnd(waitCh <-chan struct{}) bool {
 	case <-waitCh:
 		return true
 	}
+}
+
+func (t *Topic) nextPromptID() string {
+	t.metaMu.Lock()
+	defer t.metaMu.Unlock()
+	t.promptSeq++
+	return fmt.Sprintf("p_%s_%d", t.Conversation.ConversationID, t.promptSeq)
+}
+
+func (t *Topic) nextEventMeta() (string, string) {
+	t.metaMu.Lock()
+	defer t.metaMu.Unlock()
+	t.eventSeq++
+	return fmt.Sprintf("e_%s_%d", t.Conversation.ConversationID, t.eventSeq), time.Now().UTC().Format(time.RFC3339)
+}
+
+func (t *Topic) broadcastQueueEvent(msg workspaceWSMessage) {
+	msg.EventID, msg.Timestamp = t.nextEventMeta()
+	t.WSHub.Broadcast(msg)
+}
+
+func (t *Topic) broadcastQueueSnapshot() {
+	snapshot := t.QueueSnapshot()
+	eventID, timestamp := t.nextEventMeta()
+	t.WSHub.Broadcast(workspaceWSMessage{
+		Type:           "queue_snapshot",
+		EventID:        eventID,
+		Timestamp:      timestamp,
+		SessionID:      snapshot.SessionID,
+		ActivePromptID: snapshot.ActivePromptID,
+		Entries:        snapshot.Entries,
+	})
 }

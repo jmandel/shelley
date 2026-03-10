@@ -366,10 +366,10 @@ func TestWorkspaceTopicWSQueuesPrompt(t *testing.T) {
 
 	waitForConnectedMessage(t, ctx, conn)
 
-	if err := wsjson.Write(ctx, conn, workspacePromptMessage{Type: "prompt", Data: "echo: first"}); err != nil {
+	if err := wsjson.Write(ctx, conn, workspacePromptMessage{Type: "prompt", PromptID: "p-first", Data: "echo: first"}); err != nil {
 		t.Fatalf("failed to send first prompt: %v", err)
 	}
-	if err := wsjson.Write(ctx, conn, workspacePromptMessage{Type: "prompt", Data: "echo: second"}); err != nil {
+	if err := wsjson.Write(ctx, conn, workspacePromptMessage{Type: "prompt", PromptID: "p-second", Data: "echo: second"}); err != nil {
 		t.Fatalf("failed to send second prompt: %v", err)
 	}
 
@@ -379,17 +379,21 @@ func TestWorkspaceTopicWSQueuesPrompt(t *testing.T) {
 	}
 
 	var (
-		queuedSeen bool
-		texts      []string
-		doneCount  int
+		queuedSeen  bool
+		startedSeen bool
+		texts       []string
+		doneCount   int
 	)
 
 	for doneCount < 2 {
 		msg := readWorkspaceWSMessage(t, ctx, conn)
 		switch msg.Type {
-		case "system":
-			if msg.Data == "queued prompt" {
+		case "prompt_status":
+			if msg.PromptID == "p-second" && msg.Status == string(PromptStatusQueued) {
 				queuedSeen = true
+			}
+			if msg.PromptID == "p-first" && msg.Status == string(PromptStatusStarted) {
+				startedSeen = true
 			}
 		case "text":
 			texts = append(texts, msg.Data)
@@ -399,7 +403,10 @@ func TestWorkspaceTopicWSQueuesPrompt(t *testing.T) {
 	}
 
 	if !queuedSeen {
-		t.Fatal("expected queued prompt system message")
+		t.Fatal("expected second prompt to emit queued status")
+	}
+	if !startedSeen {
+		t.Fatal("expected first prompt to emit started status")
 	}
 	if len(texts) < 2 {
 		t.Fatalf("expected text from both turns, got %#v", texts)
@@ -418,6 +425,73 @@ func TestWorkspaceTopicWSQueuesPrompt(t *testing.T) {
 	secondTurnText := lastUserText(requests[len(requests)-1])
 	if firstTurnText != "echo: first" || secondTurnText != "echo: second" {
 		t.Fatalf("expected prompts to run as separate turns, got first=%q second=%q", firstTurnText, secondTurnText)
+	}
+}
+
+func TestWorkspaceTopicQueueRESTAndCancellation(t *testing.T) {
+	t.Setenv("PREDICTABLE_DELAY_MS", "250")
+
+	server, _, _ := newTestServer(t)
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws/topic/queue-rest?client_id=cli-a"
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("failed to dial websocket: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "test complete")
+	waitForConnectedMessage(t, ctx, conn)
+
+	if err := wsjson.Write(ctx, conn, workspacePromptMessage{Type: "prompt", PromptID: "p-1", Data: "echo: first"}); err != nil {
+		t.Fatalf("failed to send first prompt: %v", err)
+	}
+	if err := wsjson.Write(ctx, conn, workspacePromptMessage{Type: "prompt", PromptID: "p-2", Data: "echo: second"}); err != nil {
+		t.Fatalf("failed to send second prompt: %v", err)
+	}
+
+	waitFor(t, 2*time.Second, func() bool {
+		req, err := http.NewRequest(http.MethodGet, httpServer.URL+"/ws/topics/queue-rest/queue", nil)
+		if err != nil {
+			return false
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			return false
+		}
+		defer resp.Body.Close()
+		var snapshot workspaceQueueSnapshot
+		if err := json.NewDecoder(resp.Body).Decode(&snapshot); err != nil {
+			return false
+		}
+		return snapshot.ActivePromptID == "p-1" && len(snapshot.Entries) == 1 && snapshot.Entries[0].PromptID == "p-2"
+	})
+
+	cancelReq, err := http.NewRequest(http.MethodDelete, httpServer.URL+"/ws/topics/queue-rest/queue/p-2", nil)
+	if err != nil {
+		t.Fatalf("failed to build queue delete request: %v", err)
+	}
+	cancelReq.Header.Set("X-Workspace-Client-ID", "cli-a")
+	cancelResp, err := http.DefaultClient.Do(cancelReq)
+	if err != nil {
+		t.Fatalf("failed to delete queued prompt: %v", err)
+	}
+	cancelResp.Body.Close()
+	if cancelResp.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected 204 from queue delete, got %d", cancelResp.StatusCode)
+	}
+
+	var cancelledSeen bool
+	for !cancelledSeen {
+		msg := readWorkspaceWSMessage(t, ctx, conn)
+		if msg.Type == "prompt_status" && msg.PromptID == "p-2" && msg.Status == string(PromptStatusCancelled) {
+			cancelledSeen = true
+		}
 	}
 }
 

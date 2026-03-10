@@ -660,12 +660,15 @@ func (s *Server) handleChatConversation(w http.ResponseWriter, r *http.Request, 
 
 		senderID := userEmail
 		if senderID == "" {
+			senderID = strings.TrimSpace(r.Header.Get("X-Workspace-Client-ID"))
+		}
+		if senderID == "" {
 			senderID = "api"
 		}
-		topic.EnqueuePrompt(req.Message, senderID)
+		prompt := topic.EnqueuePrompt("", req.Message, senderID)
 
 		w.WriteHeader(http.StatusAccepted)
-		json.NewEncoder(w).Encode(map[string]string{"status": "accepted"})
+		json.NewEncoder(w).Encode(map[string]string{"status": "accepted", "promptId": prompt.PromptID})
 		return
 	}
 
