@@ -324,6 +324,71 @@ func TestWorkspaceToolsRejectInvalidGrantAccess(t *testing.T) {
 	}
 }
 
+func TestWorkspaceToolCallsAreLogged(t *testing.T) {
+	server, _, _ := newTestServer(t)
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	sessionID := createWorkspaceTopic(t, httpServer.URL, "log-allowed")
+	createWorkspaceTool(t, httpServer.URL, `{
+		"name":"github",
+		"actions":["read","write"]
+	}`)
+	createWorkspaceGrant(t, httpServer.URL, "github", `{
+		"subject":"agent:*",
+		"actions":["read"],
+		"access":"allowed"
+	}`)
+
+	sendTopicAPIChat(t, httpServer.URL, sessionID, "workspace_tool: github read")
+
+	var toolInfo workspaceToolInfo
+	waitFor(t, 2*time.Second, func() bool {
+		toolInfo = getWorkspaceToolInfo(t, httpServer.URL, "github")
+		return len(toolInfo.Log) > 0
+	})
+
+	if toolInfo.Log[0].Action != "read" || toolInfo.Log[0].AccessDecision != workspaceGrantAllowed {
+		t.Fatalf("unexpected workspace tool log entry: %#v", toolInfo.Log[0])
+	}
+	if toolInfo.Log[0].TopicName != "log-allowed" || toolInfo.Log[0].Subject != "agent:log-allowed" {
+		t.Fatalf("unexpected workspace tool log scope: %#v", toolInfo.Log[0])
+	}
+}
+
+func TestWorkspaceToolApprovalRequiredLogsDenied(t *testing.T) {
+	server, _, _ := newTestServer(t)
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	sessionID := createWorkspaceTopic(t, httpServer.URL, "log-approval")
+	createWorkspaceTool(t, httpServer.URL, `{
+		"name":"gmail",
+		"actions":["send"]
+	}`)
+	createWorkspaceGrant(t, httpServer.URL, "gmail", `{
+		"subject":"agent:*",
+		"actions":["send"],
+		"access":"approval_required"
+	}`)
+
+	sendTopicAPIChat(t, httpServer.URL, sessionID, "workspace_tool: gmail send")
+
+	var toolInfo workspaceToolInfo
+	waitFor(t, 2*time.Second, func() bool {
+		toolInfo = getWorkspaceToolInfo(t, httpServer.URL, "gmail")
+		return len(toolInfo.Log) > 0
+	})
+
+	if toolInfo.Log[0].Action != "send" || toolInfo.Log[0].AccessDecision != workspaceGrantDenied {
+		t.Fatalf("expected approval-required call to log denied, got %#v", toolInfo.Log[0])
+	}
+}
+
 func createWorkspaceTopic(t *testing.T, baseURL, topicName string) string {
 	t.Helper()
 
@@ -415,4 +480,23 @@ func requestToolNames(req *llm.Request) []string {
 		names = append(names, tool.Name)
 	}
 	return names
+}
+
+func getWorkspaceToolInfo(t *testing.T, baseURL, toolName string) workspaceToolInfo {
+	t.Helper()
+
+	resp, err := http.Get(baseURL + "/ws/tools/" + toolName)
+	if err != nil {
+		t.Fatalf("failed to fetch workspace tool info: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 from workspace tool info, got %d", resp.StatusCode)
+	}
+
+	var info workspaceToolInfo
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		t.Fatalf("failed to decode workspace tool info: %v", err)
+	}
+	return info
 }

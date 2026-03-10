@@ -32,3 +32,15 @@ ORDER BY created_at ASC;
 -- name: DeleteWorkspaceGrant :exec
 DELETE FROM workspace_grants
 WHERE grant_id = ?;
+
+-- name: CreateWorkspaceToolLog :one
+INSERT INTO workspace_tool_log (
+    log_id, tool_id, topic_name, action, subject, access_decision, approved_by, input_summary
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+RETURNING *;
+
+-- name: ListWorkspaceToolLogByToolID :many
+SELECT * FROM workspace_tool_log
+WHERE tool_id = ?
+ORDER BY created_at DESC;

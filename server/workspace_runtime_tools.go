@@ -7,6 +7,8 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/google/uuid"
+
 	"shelley.exe.dev/db/generated"
 	"shelley.exe.dev/llm"
 )
@@ -91,7 +93,7 @@ func (s *Server) buildTopicWorkspaceTool(ctx context.Context, topicName string, 
 		Description: buildWorkspaceToolDescription(toolRecord.Description, visibleActions),
 		InputSchema: buildWorkspaceToolSchema(visibleActions),
 		Run: func(ctx context.Context, input json.RawMessage) llm.ToolOut {
-			return runWorkspaceTool(toolCopy, actionsCopy, policyCopy, input)
+			return s.runWorkspaceTool(ctx, topicName, toolCopy, actionsCopy, policyCopy, input)
 		},
 	}, nil
 }
@@ -128,7 +130,7 @@ func buildWorkspaceToolSchema(actions []string) json.RawMessage {
 	return schema
 }
 
-func runWorkspaceTool(toolRecord generated.WorkspaceTool, registeredActions []string, actionPolicies map[string]string, input json.RawMessage) llm.ToolOut {
+func (s *Server) runWorkspaceTool(ctx context.Context, topicName string, toolRecord generated.WorkspaceTool, registeredActions []string, actionPolicies map[string]string, input json.RawMessage) llm.ToolOut {
 	var req workspaceToolInvocation
 	if err := json.Unmarshal(input, &req); err != nil {
 		return llm.ToolOut{Error: fmt.Errorf("invalid workspace tool input: %w", err)}
@@ -142,7 +144,16 @@ func runWorkspaceTool(toolRecord generated.WorkspaceTool, registeredActions []st
 		return llm.ToolOut{Error: fmt.Errorf("unknown workspace tool action: %s", req.Action)}
 	}
 
+	subject := "agent:" + topicName
 	access := actionPolicies[req.Action]
+	decision := workspaceGrantDenied
+	if access == workspaceGrantAllowed {
+		decision = workspaceGrantAllowed
+	}
+	if err := s.recordWorkspaceToolLog(ctx, toolRecord, topicName, req.Action, subject, decision, "", input); err != nil {
+		return llm.ToolOut{Error: err}
+	}
+
 	switch access {
 	case workspaceGrantAllowed:
 		return llm.ToolOut{Error: fmt.Errorf("workspace tool execution not implemented for %s/%s", toolRecord.Name, req.Action)}
@@ -153,6 +164,45 @@ func runWorkspaceTool(toolRecord generated.WorkspaceTool, registeredActions []st
 	default:
 		return llm.ToolOut{Error: fmt.Errorf("no grant for %s/%s", toolRecord.Name, req.Action)}
 	}
+}
+
+func (s *Server) recordWorkspaceToolLog(ctx context.Context, toolRecord generated.WorkspaceTool, topicName, action, subject, accessDecision, approvedBy string, input json.RawMessage) error {
+	var topicNamePtr, approvedByPtr, inputSummaryPtr *string
+	if topicName != "" {
+		topicNamePtr = &topicName
+	}
+	if approvedBy != "" {
+		approvedByPtr = &approvedBy
+	}
+	if summary := summarizeWorkspaceToolInput(input); summary != "" {
+		inputSummaryPtr = &summary
+	}
+
+	return s.db.QueriesTx(ctx, func(q *generated.Queries) error {
+		_, err := q.CreateWorkspaceToolLog(ctx, generated.CreateWorkspaceToolLogParams{
+			LogID:          uuid.NewString(),
+			ToolID:         toolRecord.ToolID,
+			TopicName:      topicNamePtr,
+			Action:         action,
+			Subject:        subject,
+			AccessDecision: accessDecision,
+			ApprovedBy:     approvedByPtr,
+			InputSummary:   inputSummaryPtr,
+		})
+		return err
+	})
+}
+
+func summarizeWorkspaceToolInput(input json.RawMessage) string {
+	if len(input) == 0 {
+		return ""
+	}
+	const maxSummaryLen = 512
+	summary := string(input)
+	if len(summary) <= maxSummaryLen {
+		return summary
+	}
+	return summary[:maxSummaryLen] + "..."
 }
 
 func workspaceActionPolicies(grantRecords []generated.WorkspaceGrant, topicName string, registeredActions []string) (map[string]string, error) {

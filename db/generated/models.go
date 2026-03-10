@@ -112,3 +112,15 @@ type WorkspaceTool struct {
 	Config        *string   `json:"config"`
 	CreatedAt     time.Time `json:"created_at"`
 }
+
+type WorkspaceToolLog struct {
+	LogID          string    `json:"log_id"`
+	ToolID         string    `json:"tool_id"`
+	TopicName      *string   `json:"topic_name"`
+	Action         string    `json:"action"`
+	Subject        string    `json:"subject"`
+	AccessDecision string    `json:"access_decision"`
+	ApprovedBy     *string   `json:"approved_by"`
+	InputSummary   *string   `json:"input_summary"`
+	CreatedAt      time.Time `json:"created_at"`
+}

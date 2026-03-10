@@ -197,6 +197,14 @@ func (s *PredictableService) Do(ctx context.Context, req *llm.Request) (*llm.Res
 			return s.makeChangeDirToolResponse(path, inputTokens), nil
 		}
 
+		if strings.HasPrefix(inputText, "workspace_tool: ") {
+			parts := strings.SplitN(strings.TrimPrefix(inputText, "workspace_tool: "), " ", 2)
+			if len(parts) == 2 && s.requestHasTool(req, "workspace_"+parts[0]) {
+				return s.makeWorkspaceToolResponse(parts[0], parts[1], inputTokens), nil
+			}
+			return s.makeResponse("workspace tool unavailable", inputTokens), nil
+		}
+
 		if strings.HasPrefix(inputText, "delay: ") {
 			delayStr := strings.TrimPrefix(inputText, "delay: ")
 			delaySeconds, err := strconv.ParseFloat(delayStr, 64)
@@ -468,6 +476,18 @@ func (s *PredictableService) ClearRequests() {
 	s.recentRequests = nil
 }
 
+func (s *PredictableService) requestHasTool(req *llm.Request, toolName string) bool {
+	if req == nil {
+		return false
+	}
+	for _, tool := range req.Tools {
+		if tool.Name == toolName {
+			return true
+		}
+	}
+	return false
+}
+
 // countRequestTokens estimates token count based on character count.
 // Uses a simple ~4 chars per token approximation.
 func (s *PredictableService) countRequestTokens(req *llm.Request) uint64 {
@@ -573,6 +593,37 @@ func (s *PredictableService) makeChangeDirToolResponse(path string, inputTokens 
 			InputTokens:  inputTokens,
 			OutputTokens: outputTokens,
 			CostUSD:      0.001,
+		},
+	}
+}
+
+func (s *PredictableService) makeWorkspaceToolResponse(toolName, action string, inputTokens uint64) *llm.Response {
+	toolInputBytes, _ := json.Marshal(map[string]string{"action": action})
+	toolInput := json.RawMessage(toolInputBytes)
+	responseText := fmt.Sprintf("I'll use workspace_%s for %s.", toolName, action)
+	outputTokens := uint64(len(responseText)/4 + len(toolInputBytes)/4)
+	if outputTokens == 0 {
+		outputTokens = 1
+	}
+	return &llm.Response{
+		ID:    fmt.Sprintf("pred-workspace-%d", time.Now().UnixNano()),
+		Type:  "message",
+		Role:  llm.MessageRoleAssistant,
+		Model: "predictable-v1",
+		Content: []llm.Content{
+			{Type: llm.ContentTypeText, Text: responseText},
+			{
+				ID:        fmt.Sprintf("tool_%d", time.Now().UnixNano()%1000),
+				Type:      llm.ContentTypeToolUse,
+				ToolName:  "workspace_" + toolName,
+				ToolInput: toolInput,
+			},
+		},
+		StopReason: llm.StopReasonToolUse,
+		Usage: llm.Usage{
+			InputTokens:  inputTokens,
+			OutputTokens: outputTokens,
+			CostUSD:      0.0,
 		},
 	}
 }

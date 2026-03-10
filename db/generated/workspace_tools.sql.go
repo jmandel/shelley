@@ -96,6 +96,51 @@ func (q *Queries) CreateWorkspaceTool(ctx context.Context, arg CreateWorkspaceTo
 	return i, err
 }
 
+const createWorkspaceToolLog = `-- name: CreateWorkspaceToolLog :one
+INSERT INTO workspace_tool_log (
+    log_id, tool_id, topic_name, action, subject, access_decision, approved_by, input_summary
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+RETURNING log_id, tool_id, topic_name, "action", subject, access_decision, approved_by, input_summary, created_at
+`
+
+type CreateWorkspaceToolLogParams struct {
+	LogID          string  `json:"log_id"`
+	ToolID         string  `json:"tool_id"`
+	TopicName      *string `json:"topic_name"`
+	Action         string  `json:"action"`
+	Subject        string  `json:"subject"`
+	AccessDecision string  `json:"access_decision"`
+	ApprovedBy     *string `json:"approved_by"`
+	InputSummary   *string `json:"input_summary"`
+}
+
+func (q *Queries) CreateWorkspaceToolLog(ctx context.Context, arg CreateWorkspaceToolLogParams) (WorkspaceToolLog, error) {
+	row := q.db.QueryRowContext(ctx, createWorkspaceToolLog,
+		arg.LogID,
+		arg.ToolID,
+		arg.TopicName,
+		arg.Action,
+		arg.Subject,
+		arg.AccessDecision,
+		arg.ApprovedBy,
+		arg.InputSummary,
+	)
+	var i WorkspaceToolLog
+	err := row.Scan(
+		&i.LogID,
+		&i.ToolID,
+		&i.TopicName,
+		&i.Action,
+		&i.Subject,
+		&i.AccessDecision,
+		&i.ApprovedBy,
+		&i.InputSummary,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const deleteWorkspaceGrant = `-- name: DeleteWorkspaceGrant :exec
 DELETE FROM workspace_grants
 WHERE grant_id = ?
@@ -161,6 +206,45 @@ func (q *Queries) ListWorkspaceGrantsByToolID(ctx context.Context, toolID string
 			&i.Access,
 			&i.Approvers,
 			&i.Scope,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listWorkspaceToolLogByToolID = `-- name: ListWorkspaceToolLogByToolID :many
+SELECT log_id, tool_id, topic_name, "action", subject, access_decision, approved_by, input_summary, created_at FROM workspace_tool_log
+WHERE tool_id = ?
+ORDER BY created_at DESC
+`
+
+func (q *Queries) ListWorkspaceToolLogByToolID(ctx context.Context, toolID string) ([]WorkspaceToolLog, error) {
+	rows, err := q.db.QueryContext(ctx, listWorkspaceToolLogByToolID, toolID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []WorkspaceToolLog{}
+	for rows.Next() {
+		var i WorkspaceToolLog
+		if err := rows.Scan(
+			&i.LogID,
+			&i.ToolID,
+			&i.TopicName,
+			&i.Action,
+			&i.Subject,
+			&i.AccessDecision,
+			&i.ApprovedBy,
+			&i.InputSummary,
 			&i.CreatedAt,
 		); err != nil {
 			return nil, err

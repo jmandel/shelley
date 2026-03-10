@@ -25,16 +25,28 @@ type workspaceGrantInfo struct {
 }
 
 type workspaceToolInfo struct {
-	ToolID        string               `json:"toolId"`
-	Name          string               `json:"name"`
-	Description   string               `json:"description,omitempty"`
-	Protocol      string               `json:"protocol"`
-	Actions       []string             `json:"actions"`
-	Provider      string               `json:"provider,omitempty"`
-	CredentialRef string               `json:"credentialRef,omitempty"`
-	Config        json.RawMessage      `json:"config,omitempty"`
-	CreatedAt     string               `json:"createdAt"`
-	Grants        []workspaceGrantInfo `json:"grants,omitempty"`
+	ToolID        string                 `json:"toolId"`
+	Name          string                 `json:"name"`
+	Description   string                 `json:"description,omitempty"`
+	Protocol      string                 `json:"protocol"`
+	Actions       []string               `json:"actions"`
+	Provider      string                 `json:"provider,omitempty"`
+	CredentialRef string                 `json:"credentialRef,omitempty"`
+	Config        json.RawMessage        `json:"config,omitempty"`
+	CreatedAt     string                 `json:"createdAt"`
+	Grants        []workspaceGrantInfo   `json:"grants,omitempty"`
+	Log           []workspaceToolLogInfo `json:"log,omitempty"`
+}
+
+type workspaceToolLogInfo struct {
+	LogID          string `json:"logId"`
+	TopicName      string `json:"topicName,omitempty"`
+	Action         string `json:"action"`
+	Subject        string `json:"subject"`
+	AccessDecision string `json:"accessDecision"`
+	ApprovedBy     string `json:"approvedBy,omitempty"`
+	InputSummary   string `json:"inputSummary,omitempty"`
+	CreatedAt      string `json:"createdAt"`
 }
 
 func (s *Server) handleWorkspaceTools(w http.ResponseWriter, r *http.Request) {
@@ -133,7 +145,7 @@ func (s *Server) handleWorkspaceToolsCreate(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	info, err := s.workspaceToolInfo(r.Context(), tool)
+	info, err := s.workspaceToolInfo(r.Context(), tool, false)
 	if err != nil {
 		s.logger.Error("Failed to build workspace tool response", "name", req.Name, "error", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
@@ -160,7 +172,7 @@ func (s *Server) handleWorkspaceTool(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		info, err := s.workspaceToolInfo(r.Context(), *tool)
+		info, err := s.workspaceToolInfo(r.Context(), *tool, true)
 		if err != nil {
 			s.logger.Error("Failed to build workspace tool response", "tool", toolName, "error", err)
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
@@ -343,7 +355,7 @@ func (s *Server) listWorkspaceToolInfos(ctx context.Context) ([]workspaceToolInf
 
 	infos := make([]workspaceToolInfo, 0, len(tools))
 	for _, tool := range tools {
-		info, err := s.workspaceToolInfo(ctx, tool)
+		info, err := s.workspaceToolInfo(ctx, tool, false)
 		if err != nil {
 			return nil, err
 		}
@@ -352,7 +364,7 @@ func (s *Server) listWorkspaceToolInfos(ctx context.Context) ([]workspaceToolInf
 	return infos, nil
 }
 
-func (s *Server) workspaceToolInfo(ctx context.Context, tool generated.WorkspaceTool) (workspaceToolInfo, error) {
+func (s *Server) workspaceToolInfo(ctx context.Context, tool generated.WorkspaceTool, includeLog bool) (workspaceToolInfo, error) {
 	var grants []generated.WorkspaceGrant
 	if err := s.db.Queries(ctx, func(q *generated.Queries) error {
 		var err error
@@ -360,6 +372,17 @@ func (s *Server) workspaceToolInfo(ctx context.Context, tool generated.Workspace
 		return err
 	}); err != nil {
 		return workspaceToolInfo{}, err
+	}
+
+	var logs []generated.WorkspaceToolLog
+	if includeLog {
+		if err := s.db.Queries(ctx, func(q *generated.Queries) error {
+			var err error
+			logs, err = q.ListWorkspaceToolLogByToolID(ctx, tool.ToolID)
+			return err
+		}); err != nil {
+			return workspaceToolInfo{}, err
+		}
 	}
 
 	actions, err := decodeJSONStringSlice(tool.Actions)
@@ -374,6 +397,9 @@ func (s *Server) workspaceToolInfo(ctx context.Context, tool generated.Workspace
 		Actions:   actions,
 		CreatedAt: tool.CreatedAt.Format(time.RFC3339),
 		Grants:    make([]workspaceGrantInfo, 0, len(grants)),
+	}
+	if includeLog {
+		info.Log = make([]workspaceToolLogInfo, 0, len(logs))
 	}
 	if tool.Description != nil {
 		info.Description = *tool.Description
@@ -394,6 +420,9 @@ func (s *Server) workspaceToolInfo(ctx context.Context, tool generated.Workspace
 			return workspaceToolInfo{}, err
 		}
 		info.Grants = append(info.Grants, grantInfo)
+	}
+	for _, logEntry := range logs {
+		info.Log = append(info.Log, workspaceToolLogInfoFromRecord(logEntry))
 	}
 
 	return info, nil
@@ -423,6 +452,26 @@ func workspaceGrantInfoFromRecord(grant generated.WorkspaceGrant) (workspaceGran
 		info.Scope = json.RawMessage(*grant.Scope)
 	}
 	return info, nil
+}
+
+func workspaceToolLogInfoFromRecord(logEntry generated.WorkspaceToolLog) workspaceToolLogInfo {
+	info := workspaceToolLogInfo{
+		LogID:          logEntry.LogID,
+		Action:         logEntry.Action,
+		Subject:        logEntry.Subject,
+		AccessDecision: logEntry.AccessDecision,
+		CreatedAt:      logEntry.CreatedAt.Format(time.RFC3339),
+	}
+	if logEntry.TopicName != nil {
+		info.TopicName = *logEntry.TopicName
+	}
+	if logEntry.ApprovedBy != nil {
+		info.ApprovedBy = *logEntry.ApprovedBy
+	}
+	if logEntry.InputSummary != nil {
+		info.InputSummary = *logEntry.InputSummary
+	}
+	return info
 }
 
 func decodeJSONStringSlice(raw string) ([]string, error) {
