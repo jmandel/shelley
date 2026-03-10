@@ -1,9 +1,11 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -362,6 +364,65 @@ func TestWorkspaceTopicWSQueuesPrompt(t *testing.T) {
 	secondTurnText := lastUserText(requests[len(requests)-1])
 	if firstTurnText != "echo: first" || secondTurnText != "echo: second" {
 		t.Fatalf("expected prompts to run as separate turns, got first=%q second=%q", firstTurnText, secondTurnText)
+	}
+}
+
+func TestWorkspaceTopicWSPromptBroadcastsToSSE(t *testing.T) {
+	server, _, _ := newTestServer(t)
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	createReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/topics", bytes.NewBufferString(`{"name":"sse-collab"}`))
+	if err != nil {
+		t.Fatalf("failed to build create request: %v", err)
+	}
+	createReq.Header.Set("Content-Type", "application/json")
+
+	createResp, err := http.DefaultClient.Do(createReq)
+	if err != nil {
+		t.Fatalf("failed to create topic: %v", err)
+	}
+	defer createResp.Body.Close()
+	if createResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 from create, got %d", createResp.StatusCode)
+	}
+
+	var created workspaceTopicInfo
+	if err := json.NewDecoder(createResp.Body).Decode(&created); err != nil {
+		t.Fatalf("failed to decode create response: %v", err)
+	}
+
+	sseResp, err := http.Get(httpServer.URL + "/api/conversation/" + created.SessionID + "/stream")
+	if err != nil {
+		t.Fatalf("failed to open sse stream: %v", err)
+	}
+	defer sseResp.Body.Close()
+	if sseResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 from sse stream, got %d", sseResp.StatusCode)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	streamEvents := make(chan StreamResponse, 32)
+	go collectSSEStreamResponses(ctx, sseResp.Body, streamEvents)
+
+	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws/topic/sse-collab"
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("failed to dial websocket: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "test complete")
+
+	waitForConnectedMessage(t, ctx, conn)
+	if err := wsjson.Write(ctx, conn, workspacePromptMessage{Type: "prompt", Data: "echo: from ws to sse"}); err != nil {
+		t.Fatalf("failed to send prompt: %v", err)
+	}
+
+	if !waitForSSEText(ctx, streamEvents, "from ws to sse") {
+		t.Fatal("expected websocket prompt output to appear on the sse stream")
 	}
 }
 
@@ -728,4 +789,53 @@ func lastUserText(req *llm.Request) string {
 		}
 	}
 	return ""
+}
+
+func collectSSEStreamResponses(ctx context.Context, body io.Reader, out chan<- StreamResponse) {
+	scanner := bufio.NewScanner(body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	for scanner.Scan() {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+
+		var event StreamResponse
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &event); err != nil {
+			continue
+		}
+
+		select {
+		case out <- event:
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func waitForSSEText(ctx context.Context, events <-chan StreamResponse, text string) bool {
+	toolTitles := make(map[string]string)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case event := <-events:
+			for _, msg := range event.Messages {
+				translated, _ := translateWorkspaceWSMessagesForAPIMessage(toolTitles, msg)
+				for _, translatedMsg := range translated {
+					if translatedMsg.Type == "text" && translatedMsg.Data == text {
+						return true
+					}
+				}
+			}
+		}
+	}
 }
