@@ -57,6 +57,36 @@ func (s wsDemoScript) usesTool() bool {
 	}
 }
 
+const wsDemoLanguageGuide = `WS language quick guide
+
+Use: ws [tags...]
+
+Primary actions:
+- text "..." or echo "..."
+- bash "..."
+- validator "path-or-args"
+- publisher "path-or-args"
+- jira "search terms"
+- tool <tool-name> action <action-name> input '{"json":"value"}'
+
+Timing tags:
+- pause2 or pause 2
+- toolpause3 or toolpause 3
+- afterpause1 or afterpause 1
+- aftertext "Done."
+
+Examples:
+- ws text "Thanks, what should we do next?"
+- ws pause2 jira "Observation.component slicing"
+- ws validator "input/fsh/BloodPressurePanel.fsh" toolpause3 aftertext "Validator finished."
+- ws tool hl7-jira action jira.search input '{"query":"validator warning blood pressure slicing"}'
+
+Rules:
+- tags can appear in any order
+- use exactly one primary action
+- wrap multi-word values in quotes
+- input must be valid JSON`
+
 // NewPredictableService creates a new predictable LLM service
 func NewPredictableService() *PredictableService {
 	svc := &PredictableService{
@@ -245,6 +275,10 @@ func (s *PredictableService) Do(ctx context.Context, req *llm.Request) (*llm.Res
 			return s.makeResponse(fmt.Sprintf("Delayed for %s seconds", delayStr), inputTokens), nil
 		}
 
+		if isWSDemoHelp(inputText) {
+			return s.makeResponse(wsDemoLanguageGuide, inputTokens), nil
+		}
+
 		if strings.HasPrefix(inputText, "ws ") || strings.HasPrefix(inputText, "ws: ") || inputText == "ws" || inputText == "ws:" {
 			script, err := parseWSDemoScript(inputText)
 			if err != nil {
@@ -291,6 +325,15 @@ func predictableInputContext(req *llm.Request) (currentText, latestUserText stri
 	}
 
 	return currentText, latestUserText, hasToolResult
+}
+
+func isWSDemoHelp(inputText string) bool {
+	switch strings.TrimSpace(inputText) {
+	case "ws help", "ws: help", "ws tutorial", "ws: tutorial", "ws examples", "ws: examples":
+		return true
+	default:
+		return false
+	}
 }
 
 func parseWSDemoScript(inputText string) (wsDemoScript, error) {

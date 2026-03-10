@@ -312,6 +312,22 @@ func TestPredictableServiceWSDemoJiraTaggedArgs(t *testing.T) {
 	}
 }
 
+func TestPredictableServiceWSHelp(t *testing.T) {
+	service := NewPredictableService()
+
+	resp, err := service.Do(context.Background(), &llm.Request{
+		Messages: []llm.Message{
+			{Role: llm.MessageRoleUser, Content: []llm.Content{{Type: llm.ContentTypeText, Text: "ws help"}}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ws help failed: %v", err)
+	}
+	if got := resp.Content[0].Text; !strings.Contains(got, "Primary actions:") || !strings.Contains(got, "toolpause3") {
+		t.Fatalf("unexpected ws help response %q", got)
+	}
+}
+
 func TestPredictableServiceWSDemoToolPauseAndAfterText(t *testing.T) {
 	service := NewPredictableService()
 	ctx := context.Background()

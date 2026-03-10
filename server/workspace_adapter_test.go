@@ -610,6 +610,39 @@ func TestWorkspaceTopicQueueRESTUpdateAndMove(t *testing.T) {
 			movedSeen = true
 		}
 	}
+
+	moveBottomReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/ws/topics/queue-edit/queue/p-3/move", bytes.NewBufferString(`{"direction":"bottom"}`))
+	if err != nil {
+		t.Fatalf("failed to build queue bottom move request: %v", err)
+	}
+	moveBottomReq.Header.Set("Content-Type", "application/json")
+	moveBottomReq.Header.Set("X-Workspace-Client-ID", "cli-b")
+	moveBottomResp, err := http.DefaultClient.Do(moveBottomReq)
+	if err != nil {
+		t.Fatalf("failed to move queued prompt to bottom: %v", err)
+	}
+	if moveBottomResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(moveBottomResp.Body)
+		moveBottomResp.Body.Close()
+		t.Fatalf("expected 200 from queue bottom move, got %d: %s", moveBottomResp.StatusCode, string(body))
+	}
+	var bottomSnapshot workspaceQueueSnapshot
+	if err := json.NewDecoder(moveBottomResp.Body).Decode(&bottomSnapshot); err != nil {
+		moveBottomResp.Body.Close()
+		t.Fatalf("failed to decode queue bottom move response: %v", err)
+	}
+	moveBottomResp.Body.Close()
+	if got := bottomSnapshot.Entries[len(bottomSnapshot.Entries)-1].PromptID; got != "p-3" {
+		t.Fatalf("expected moved prompt to be last in queue after bottom move, got %q", got)
+	}
+
+	var bottomSeen bool
+	for !bottomSeen {
+		msg := readWorkspaceWSMessage(t, ctx, conn)
+		if msg.Type == "queue_entry_moved" && msg.PromptID == "p-3" && msg.Direction == "bottom" && msg.Position == 2 {
+			bottomSeen = true
+		}
+	}
 }
 
 func TestWorkspaceTopicWSReplaysRecentMessagesOnConnect(t *testing.T) {
