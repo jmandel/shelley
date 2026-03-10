@@ -77,33 +77,48 @@ Timing tags:
 
 Examples:
 - ws text "Thanks, what should we do next?"
-- ws pause2 jira "Observation.component slicing"
-- ws validator "input/fsh/BloodPressurePanel.fsh" toolpause3 aftertext "Validator finished."
-- ws tool hl7-jira action jira.search input '{"query":"validator warning blood pressure slicing"}'
+- ws pause2 jira "blood pressure validator example errors"
+- ws validator "input/examples/Patient-bp-alice-smith.json input/examples/Observation-bp-alice-morning.json" toolpause3 aftertext "Validator finished."
+- ws tool hl7-jira action jira.search input '{"query":"validator error handling bad codes invalid dates"}'
 
 Whole demo commands:
 1. Validator run that stays busy long enough to show queueing
-   ws validator "input/fsh/BloodPressurePanel.fsh" toolpause5 aftertext "The validator is pointing at missing slicing metadata on Observation.component."
+   ws validator "input/examples/Patient-bp-alice-smith.json input/examples/Observation-bp-alice-morning.json" toolpause5 aftertext "The validator found bad patient demographics and a broken blood pressure example."
 2. A late-joining participant asks for related Jira issues
-   ws jira "Observation.component slicing validator failure" pause1
-3. Inspect the broken profile from bash
-   ws bash "sed -n '1,200p' input/fsh/BloodPressurePanel.fsh"
-4. Simulate making the slicing fix from bash
-   ws bash "python - <<'PY'
+   ws jira "FHIR validator example errors invalid dates bad codes blood pressure" pause1
+3. Inspect the broken example resources from bash
+   ws bash "sed -n '1,200p' input/examples/Patient-bp-alice-smith.json && printf '\n---\n' && sed -n '1,240p' input/examples/Observation-bp-alice-morning.json"
+4. Simulate fixing both example resources from bash
+   ws bash "python3 - <<'PY'
+import json
 from pathlib import Path
-path = Path('input/fsh/BloodPressurePanel.fsh')
-text = path.read_text()
-needle = '* component contains\n'
-insert = '* component ^slicing.discriminator[0].type = #pattern\n* component ^slicing.discriminator[0].path = \"code\"\n* component ^slicing.rules = #open\n'
-if insert not in text:
-    text = text.replace(needle, insert + needle, 1)
-path.write_text(text)
-print('Inserted slicing metadata.')
+
+patient_path = Path('input/examples/Patient-bp-alice-smith.json')
+patient = json.loads(patient_path.read_text())
+patient['gender'] = 'female'
+patient['birthDate'] = '1974-12-25'
+patient_path.write_text(json.dumps(patient, indent=2) + '\n')
+
+obs_path = Path('input/examples/Observation-bp-alice-morning.json')
+observation = json.loads(obs_path.read_text())
+observation['effectiveDateTime'] = '2026-02-28T07:00:00Z'
+observation['component'] = [
+  {
+    'code': {'coding': [{'system': 'http://loinc.org', 'code': '8480-6', 'display': 'Systolic blood pressure'}]},
+    'valueQuantity': {'value': 126, 'unit': 'mmHg', 'system': 'http://unitsofmeasure.org', 'code': 'mm[Hg]'}
+  },
+  {
+    'code': {'coding': [{'system': 'http://loinc.org', 'code': '8462-4', 'display': 'Diastolic blood pressure'}]},
+    'valueQuantity': {'value': 78, 'unit': 'mmHg', 'system': 'http://unitsofmeasure.org', 'code': 'mm[Hg]'}
+  }
+]
+obs_path.write_text(json.dumps(observation, indent=2) + '\n')
+print('Updated both example resources.')
 PY"
 5. Re-run validation after the fix
-   ws validator "input/fsh/BloodPressurePanel.fsh" aftertext "Validation now passes the slicing step."
+   ws validator "input/examples/Patient-bp-alice-smith.json input/examples/Observation-bp-alice-morning.json" aftertext "The hard validator errors are gone. Only expected warnings remain without a terminology server."
 6. Short narration or handoff text
-   ws text "Marco, can you review the updated profile before we publish the preview?"
+   ws text "Marco, can you review the updated example resources before we publish the preview?"
 
 Rules:
 - tags can appear in any order
@@ -223,7 +238,7 @@ func (s *PredictableService) Do(ctx context.Context, req *llm.Request) (*llm.Res
 
 		if strings.HasPrefix(inputText, "bash: ") {
 			cmd := strings.TrimPrefix(inputText, "bash: ")
-			return s.makeBashToolResponse(cmd, inputTokens), nil
+			return s.makeBashToolResponse(cmd, predictableBashNeedsSlowOK(cmd), inputTokens), nil
 		}
 
 		if strings.HasPrefix(inputText, "think: ") {
@@ -638,19 +653,19 @@ func (s *PredictableService) makeWSDemoResponse(ctx context.Context, req *llm.Re
 	case "text", "say", "echo":
 		return s.makeResponse(script.Text, inputTokens), nil
 	case "bash":
-		return s.makeBashToolResponse(wsDemoCommandWithToolPause(script.Text, script.ToolDelay), inputTokens), nil
+		return s.makeBashToolResponse(wsDemoCommandWithToolPause(script.Text, script.ToolDelay), false, inputTokens), nil
 	case "validator":
 		command := "fhir-validator"
 		if script.Text != "" {
 			command += " " + script.Text
 		}
-		return s.makeBashToolResponse(wsDemoCommandWithToolPause(command, script.ToolDelay), inputTokens), nil
+		return s.makeBashToolResponse(wsDemoCommandWithToolPause(command, script.ToolDelay), true, inputTokens), nil
 	case "publisher":
 		command := "ig-publisher"
 		if script.Text != "" {
 			command += " " + script.Text
 		}
-		return s.makeBashToolResponse(wsDemoCommandWithToolPause(command, script.ToolDelay), inputTokens), nil
+		return s.makeBashToolResponse(wsDemoCommandWithToolPause(command, script.ToolDelay), true, inputTokens), nil
 	case "jira":
 		if !s.requestHasTool(req, "workspace_hl7-jira") {
 			return s.makeResponse("workspace tool unavailable", inputTokens), nil
@@ -677,6 +692,21 @@ func wsDemoCommandWithToolPause(command string, delay time.Duration) string {
 		return "sleep " + delaySpec
 	}
 	return "sleep " + delaySpec + "; " + command
+}
+
+func predictableBashNeedsSlowOK(command string) bool {
+	command = strings.TrimSpace(command)
+	for _, prefix := range []string{
+		"fhir-validator",
+		"ig-publisher",
+		"/tools/bin/fhir-validator",
+		"/tools/bin/ig-publisher",
+	} {
+		if command == prefix || strings.HasPrefix(command, prefix+" ") {
+			return true
+		}
+	}
+	return false
 }
 
 // makeMaxTokensResponse creates a response that simulates hitting max_tokens limit
@@ -726,9 +756,12 @@ func (s *PredictableService) makeResponse(text string, inputTokens uint64) *llm.
 }
 
 // makeBashToolResponse creates a response that calls the bash tool
-func (s *PredictableService) makeBashToolResponse(command string, inputTokens uint64) *llm.Response {
+func (s *PredictableService) makeBashToolResponse(command string, slowOK bool, inputTokens uint64) *llm.Response {
 	// Properly marshal the command to avoid JSON escaping issues
-	toolInputData := map[string]string{"command": command}
+	toolInputData := map[string]any{"command": command}
+	if slowOK {
+		toolInputData["slow_ok"] = true
+	}
 	toolInputBytes, _ := json.Marshal(toolInputData)
 	toolInput := json.RawMessage(toolInputBytes)
 	responseText := fmt.Sprintf("I'll run the command: %s", command)

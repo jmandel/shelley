@@ -323,7 +323,7 @@ func TestPredictableServiceWSHelp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ws help failed: %v", err)
 	}
-	if got := resp.Content[0].Text; !strings.Contains(got, "Primary actions:") || !strings.Contains(got, "toolpause3") || !strings.Contains(got, "Whole demo commands:") || !strings.Contains(got, "Validation now passes the slicing step.") {
+	if got := resp.Content[0].Text; !strings.Contains(got, "Primary actions:") || !strings.Contains(got, "toolpause3") || !strings.Contains(got, "Whole demo commands:") || !strings.Contains(got, "The hard validator errors are gone.") {
 		t.Fatalf("unexpected ws help response %q", got)
 	}
 }
@@ -331,7 +331,7 @@ func TestPredictableServiceWSHelp(t *testing.T) {
 func TestPredictableServiceWSDemoToolPauseAndAfterText(t *testing.T) {
 	service := NewPredictableService()
 	ctx := context.Background()
-	prompt := `ws validator "input/fsh/BloodPressurePanel.fsh" toolpause0.05 afterpause0.05 aftertext "Validator finished."`
+	prompt := `ws validator "input/examples/Patient-bp-alice-smith.json input/examples/Observation-bp-alice-morning.json" toolpause0.05 afterpause0.05 aftertext "Validator finished."`
 
 	initialReq := &llm.Request{
 		Messages: []llm.Message{
@@ -360,13 +360,16 @@ func TestPredictableServiceWSDemoToolPauseAndAfterText(t *testing.T) {
 	if toolUse.ToolName != "bash" {
 		t.Fatalf("expected bash tool, got %q", toolUse.ToolName)
 	}
-	var bashInput map[string]string
+	var bashInput map[string]any
 	if err := json.Unmarshal(toolUse.ToolInput, &bashInput); err != nil {
 		t.Fatalf("failed to decode bash input: %v", err)
 	}
-	command := bashInput["command"]
-	if !strings.Contains(command, "sleep 0.05;") || !strings.Contains(command, "fhir-validator input/fsh/BloodPressurePanel.fsh") {
+	command, _ := bashInput["command"].(string)
+	if !strings.Contains(command, "sleep 0.05;") || !strings.Contains(command, "fhir-validator input/examples/Patient-bp-alice-smith.json input/examples/Observation-bp-alice-morning.json") {
 		t.Fatalf("unexpected validator command %q", command)
+	}
+	if slowOK, _ := bashInput["slow_ok"].(bool); !slowOK {
+		t.Fatalf("expected validator bash input to request slow_ok, got %#v", bashInput)
 	}
 
 	continuationReq := &llm.Request{
@@ -398,6 +401,38 @@ func TestPredictableServiceWSDemoToolPauseAndAfterText(t *testing.T) {
 	}
 	if got := finalResp.Content[0].Text; got != "Validator finished." {
 		t.Fatalf("unexpected continuation response %q", got)
+	}
+}
+
+func TestPredictableServiceBashFHIRValidatorUsesSlowOK(t *testing.T) {
+	service := NewPredictableService()
+
+	resp, err := service.Do(context.Background(), &llm.Request{
+		Messages: []llm.Message{
+			{Role: llm.MessageRoleUser, Content: []llm.Content{{Type: llm.ContentTypeText, Text: "bash: fhir-validator input/examples/Patient-bp-alice-smith.json"}}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("bash fhir-validator failed: %v", err)
+	}
+
+	var toolUse *llm.Content
+	for i := range resp.Content {
+		if resp.Content[i].Type == llm.ContentTypeToolUse {
+			toolUse = &resp.Content[i]
+			break
+		}
+	}
+	if toolUse == nil {
+		t.Fatal("expected bash tool use content")
+	}
+
+	var bashInput map[string]any
+	if err := json.Unmarshal(toolUse.ToolInput, &bashInput); err != nil {
+		t.Fatalf("failed to decode bash input: %v", err)
+	}
+	if slowOK, _ := bashInput["slow_ok"].(bool); !slowOK {
+		t.Fatalf("expected slow_ok for validator bash command, got %#v", bashInput)
 	}
 }
 
