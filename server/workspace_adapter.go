@@ -119,7 +119,7 @@ func (s *Server) handleWorkspaceManager(w http.ResponseWriter, r *http.Request) 
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
-			if _, _, err := s.getOrCreateTopicConversation(r.Context(), topicName); err != nil && !errors.Is(err, errTopicAlreadyExists) {
+			if _, _, err := s.topicManager.GetOrCreateTopic(r.Context(), topicName); err != nil {
 				s.logger.Error("Failed to pre-create topic from workspace manager request", "topic", topicName, "error", err)
 				http.Error(w, "Internal server error", http.StatusInternalServerError)
 				return
@@ -190,12 +190,8 @@ func (s *Server) handleWorkspaceTopicsCreate(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	conversation, state, err := s.getOrCreateTopicConversation(r.Context(), topicName)
+	topic, state, err := s.topicManager.GetOrCreateTopic(r.Context(), topicName)
 	if err != nil {
-		if errors.Is(err, errTopicAlreadyExists) {
-			http.Error(w, err.Error(), http.StatusConflict)
-			return
-		}
 		s.logger.Error("Failed to create workspace topic", "topic", topicName, "error", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
@@ -204,15 +200,15 @@ func (s *Server) handleWorkspaceTopicsCreate(w http.ResponseWriter, r *http.Requ
 	if state == topicConversationCreated || state == topicConversationRestored {
 		go s.publishConversationListUpdate(ConversationListUpdate{
 			Type:         "update",
-			Conversation: conversation,
+			Conversation: topic.Conversation,
 		})
 	}
 	if state == topicConversationExisting {
-		http.Error(w, fmt.Sprintf("%s: %s", errTopicAlreadyExists, topicName), http.StatusConflict)
+		http.Error(w, fmt.Sprintf("topic already exists: %s", topicName), http.StatusConflict)
 		return
 	}
 
-	info, err := s.workspaceTopicInfo(r.Context(), r, *conversation)
+	info, err := s.workspaceTopicInfo(r.Context(), r, *topic.Conversation)
 	if err != nil {
 		s.logger.Error("Failed to build workspace topic info", "topic", topicName, "error", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
@@ -276,6 +272,7 @@ func (s *Server) handleWorkspaceTopic(w http.ResponseWriter, r *http.Request) {
 			Type:         "update",
 			Conversation: archivedConversation,
 		})
+		s.topicManager.RemoveTopicRuntime(topicName)
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{
@@ -333,7 +330,7 @@ func (s *Server) handleWorkspaceTopicWSForName(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	conversation, state, err := s.getOrCreateTopicConversation(ctx, topicName)
+	topic, state, err := s.topicManager.GetOrCreateTopic(ctx, topicName)
 	if err != nil {
 		sendWorkspaceWSMessage(ctx, outCh, workspaceWSMessage{Type: "error", Data: err.Error()})
 		return
@@ -342,50 +339,27 @@ func (s *Server) handleWorkspaceTopicWSForName(w http.ResponseWriter, r *http.Re
 	if state == topicConversationCreated {
 		go s.publishConversationListUpdate(ConversationListUpdate{
 			Type:         "update",
-			Conversation: conversation,
+			Conversation: topic.Conversation,
 		})
 		sendWorkspaceWSMessage(ctx, outCh, workspaceWSMessage{Type: "system", Data: "starting agent..."})
 	}
 	if state == topicConversationRestored {
 		go s.publishConversationListUpdate(ConversationListUpdate{
 			Type:         "update",
-			Conversation: conversation,
+			Conversation: topic.Conversation,
 		})
 		sendWorkspaceWSMessage(ctx, outCh, workspaceWSMessage{Type: "system", Data: "restoring archived topic..."})
 	}
 
-	manager, err := s.getOrCreateConversationManager(ctx, conversation.ConversationID, "")
-	if err != nil {
-		sendWorkspaceWSMessage(ctx, outCh, workspaceWSMessage{Type: "error", Data: err.Error()})
-		return
-	}
-
-	s.incrementTopicClientCount(topicName)
-	defer s.decrementTopicClientCount(topicName)
+	clientID := fmt.Sprintf("%s-%d", topicName, time.Now().UnixNano())
+	topic.WSHub.Add(clientID, outCh, cancel)
+	defer topic.WSHub.Remove(clientID)
 
 	sendWorkspaceWSMessage(ctx, outCh, workspaceWSMessage{
 		Type:      "connected",
 		Topic:     topicName,
-		SessionID: conversation.ConversationID,
+		SessionID: topic.Conversation.ConversationID,
 	})
-
-	lastSequenceID, err := s.latestSequenceID(ctx, conversation.ConversationID)
-	if err != nil {
-		sendWorkspaceWSMessage(ctx, outCh, workspaceWSMessage{Type: "error", Data: err.Error()})
-		return
-	}
-
-	next := manager.subpub.Subscribe(ctx, lastSequenceID)
-	toolTitles := make(map[string]string)
-	go func() {
-		for {
-			streamData, ok := next()
-			if !ok {
-				return
-			}
-			s.emitWorkspaceWSMessages(ctx, outCh, toolTitles, streamData)
-		}
-	}()
 
 	for {
 		var msg workspacePromptMessage
@@ -404,33 +378,9 @@ func (s *Server) handleWorkspaceTopicWSForName(w http.ResponseWriter, r *http.Re
 			continue
 		}
 
-		modelID := conversationModelID(*conversation, s.defaultTopicModelID())
-		llmService, err := s.llmManager.GetService(modelID)
-		if err != nil {
-			sendWorkspaceWSMessage(ctx, outCh, workspaceWSMessage{Type: "error", Data: err.Error()})
-			continue
-		}
-
-		busy := manager.IsAgentWorking()
-		if busy {
-			sendWorkspaceWSMessage(ctx, outCh, workspaceWSMessage{Type: "system", Data: "queued prompt"})
-		} else {
-			sendWorkspaceWSMessage(ctx, outCh, workspaceWSMessage{Type: "system", Data: "thinking..."})
-		}
-
-		userMessage := llm.Message{
-			Role: llm.MessageRoleUser,
-			Content: []llm.Content{
-				{Type: llm.ContentTypeText, Text: prompt},
-			},
-		}
-		if _, err := manager.AcceptUserMessage(ctx, llmService, modelID, userMessage); err != nil {
-			sendWorkspaceWSMessage(ctx, outCh, workspaceWSMessage{Type: "error", Data: err.Error()})
-		}
+		topic.EnqueuePrompt(prompt, clientID)
 	}
 }
-
-var errTopicAlreadyExists = errors.New("topic already exists")
 
 func (s *Server) workspaceTopics(ctx context.Context, r *http.Request) ([]workspaceTopicInfo, error) {
 	conversations, err := s.db.ListConversations(ctx, 5000, 0)
@@ -474,11 +424,20 @@ func (s *Server) workspaceTopicInfo(ctx context.Context, r *http.Request, conver
 		return workspaceTopicInfo{}, err
 	}
 
+	clients := 0
+	busy := s.isConversationWorking(conversation.ConversationID)
+	if conversation.Slug != nil {
+		if topic := s.topicManager.GetTopic(*conversation.Slug); topic != nil {
+			clients = topic.ClientCount()
+			busy = topic.IsBusy()
+		}
+	}
+
 	return workspaceTopicInfo{
 		Name:      *conversation.Slug,
 		SessionID: conversation.ConversationID,
-		Clients:   s.topicClientCount(*conversation.Slug),
-		Busy:      s.isConversationWorking(conversation.ConversationID),
+		Clients:   clients,
+		Busy:      busy,
 		LogSize:   logSize,
 		ACP:       workspaceTopicACPURL(r, *conversation.Slug),
 		CreatedAt: conversation.CreatedAt.Format(time.RFC3339),
@@ -587,28 +546,6 @@ func (s *Server) isConversationWorking(conversationID string) bool {
 	return ok && manager.IsAgentWorking()
 }
 
-func (s *Server) incrementTopicClientCount(topicName string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.topicClientCounts[topicName]++
-}
-
-func (s *Server) decrementTopicClientCount(topicName string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.topicClientCounts[topicName] <= 1 {
-		delete(s.topicClientCounts, topicName)
-		return
-	}
-	s.topicClientCounts[topicName]--
-}
-
-func (s *Server) topicClientCount(topicName string) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.topicClientCounts[topicName]
-}
-
 func (s *Server) defaultTopicModelID() string {
 	if s.defaultModel != "" {
 		return s.defaultModel
@@ -637,31 +574,40 @@ func (s *Server) workspaceTopicWriter(ctx context.Context, cancel context.Cancel
 	}
 }
 
-func (s *Server) emitWorkspaceWSMessages(ctx context.Context, outCh chan<- workspaceWSMessage, toolTitles map[string]string, streamData StreamResponse) {
+func translateWorkspaceWSMessages(toolTitles map[string]string, streamData StreamResponse) ([]workspaceWSMessage, bool) {
+	var messages []workspaceWSMessage
+	turnComplete := false
 	for _, msg := range streamData.Messages {
-		s.emitWorkspaceWSMessagesForAPIMessage(ctx, outCh, toolTitles, msg)
+		translated, msgTurnComplete := translateWorkspaceWSMessagesForAPIMessage(toolTitles, msg)
+		messages = append(messages, translated...)
+		if msgTurnComplete {
+			turnComplete = true
+		}
 	}
+	return messages, turnComplete
 }
 
-func (s *Server) emitWorkspaceWSMessagesForAPIMessage(ctx context.Context, outCh chan<- workspaceWSMessage, toolTitles map[string]string, msg APIMessage) {
+func translateWorkspaceWSMessagesForAPIMessage(toolTitles map[string]string, msg APIMessage) ([]workspaceWSMessage, bool) {
 	if msg.LlmData == nil {
-		return
+		return nil, false
 	}
 
 	var llmMsg llm.Message
 	if err := json.Unmarshal([]byte(*msg.LlmData), &llmMsg); err != nil {
-		return
+		return nil, false
 	}
+
+	messages := make([]workspaceWSMessage, 0)
 
 	switch msg.Type {
 	case string(dbpkg.MessageTypeAgent):
 		for _, content := range llmMsg.Content {
 			switch content.Type {
 			case llm.ContentTypeText:
-				sendWorkspaceWSMessage(ctx, outCh, workspaceWSMessage{Type: "text", Data: content.Text})
+				messages = append(messages, workspaceWSMessage{Type: "text", Data: content.Text})
 			case llm.ContentTypeToolUse:
 				toolTitles[content.ID] = content.ToolName
-				sendWorkspaceWSMessage(ctx, outCh, workspaceWSMessage{
+				messages = append(messages, workspaceWSMessage{
 					Type:       "tool_call",
 					ToolCallID: content.ID,
 					Title:      content.ToolName,
@@ -671,7 +617,8 @@ func (s *Server) emitWorkspaceWSMessagesForAPIMessage(ctx context.Context, outCh
 			}
 		}
 		if llmMsg.EndOfTurn {
-			sendWorkspaceWSMessage(ctx, outCh, workspaceWSMessage{Type: "done"})
+			messages = append(messages, workspaceWSMessage{Type: "done"})
+			return messages, true
 		}
 	case string(dbpkg.MessageTypeTool):
 		for _, content := range llmMsg.Content {
@@ -686,7 +633,7 @@ func (s *Server) emitWorkspaceWSMessagesForAPIMessage(ctx context.Context, outCh
 			if title == "" {
 				title = content.ToolUseID
 			}
-			sendWorkspaceWSMessage(ctx, outCh, workspaceWSMessage{
+			messages = append(messages, workspaceWSMessage{
 				Type:       "tool_update",
 				ToolCallID: content.ToolUseID,
 				Title:      title,
@@ -694,11 +641,13 @@ func (s *Server) emitWorkspaceWSMessagesForAPIMessage(ctx context.Context, outCh
 			})
 		}
 	case string(dbpkg.MessageTypeError):
-		sendWorkspaceWSMessage(ctx, outCh, workspaceWSMessage{
+		messages = append(messages, workspaceWSMessage{
 			Type: "error",
 			Data: llmMessageText(llmMsg),
 		})
 	}
+
+	return messages, false
 }
 
 func sendWorkspaceWSMessage(ctx context.Context, outCh chan<- workspaceWSMessage, msg workspaceWSMessage) bool {

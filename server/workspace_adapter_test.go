@@ -291,10 +291,10 @@ func TestWorkspaceTopicWSQueuesPrompt(t *testing.T) {
 	var (
 		queuedSeen bool
 		texts      []string
-		doneSeen   bool
+		doneCount  int
 	)
 
-	for !doneSeen {
+	for doneCount < 2 {
 		msg := readWorkspaceWSMessage(t, ctx, conn)
 		switch msg.Type {
 		case "system":
@@ -304,15 +304,106 @@ func TestWorkspaceTopicWSQueuesPrompt(t *testing.T) {
 		case "text":
 			texts = append(texts, msg.Data)
 		case "done":
-			doneSeen = true
+			doneCount++
 		}
 	}
 
 	if !queuedSeen {
 		t.Fatal("expected queued prompt system message")
 	}
-	if len(texts) == 0 {
-		t.Fatal("expected at least one text response")
+	if len(texts) < 2 {
+		t.Fatalf("expected text from both turns, got %#v", texts)
+	}
+
+	waitFor(t, 2*time.Second, func() bool {
+		return len(predictable.GetRecentRequests()) >= 2
+	})
+
+	requests := predictable.GetRecentRequests()
+	if len(requests) < 2 {
+		t.Fatalf("expected at least two LLM requests, got %d", len(requests))
+	}
+
+	firstTurnText := lastUserText(requests[len(requests)-2])
+	secondTurnText := lastUserText(requests[len(requests)-1])
+	if firstTurnText != "echo: first" || secondTurnText != "echo: second" {
+		t.Fatalf("expected prompts to run as separate turns, got first=%q second=%q", firstTurnText, secondTurnText)
+	}
+}
+
+func TestWorkspaceTopicAPIChatUsesTopicQueue(t *testing.T) {
+	t.Setenv("PREDICTABLE_DELAY_MS", "250")
+
+	server, _, predictable := newTestServer(t)
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	createReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/topics", bytes.NewBufferString(`{"name":"shared-api"}`))
+	if err != nil {
+		t.Fatalf("failed to build create request: %v", err)
+	}
+	createReq.Header.Set("Content-Type", "application/json")
+
+	createResp, err := http.DefaultClient.Do(createReq)
+	if err != nil {
+		t.Fatalf("failed to create topic: %v", err)
+	}
+	defer createResp.Body.Close()
+	if createResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 from create, got %d", createResp.StatusCode)
+	}
+
+	var created workspaceTopicInfo
+	if err := json.NewDecoder(createResp.Body).Decode(&created); err != nil {
+		t.Fatalf("failed to decode create response: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws/topic/shared-api"
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("failed to dial websocket: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "test complete")
+
+	waitForConnectedMessage(t, ctx, conn)
+
+	chatReqBody := bytes.NewBufferString(`{"message":"echo: from api","model":"predictable"}`)
+	chatReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/api/conversation/"+created.SessionID+"/chat", chatReqBody)
+	if err != nil {
+		t.Fatalf("failed to build chat request: %v", err)
+	}
+	chatReq.Header.Set("Content-Type", "application/json")
+
+	chatResp, err := http.DefaultClient.Do(chatReq)
+	if err != nil {
+		t.Fatalf("failed to post api chat: %v", err)
+	}
+	defer chatResp.Body.Close()
+	if chatResp.StatusCode != http.StatusAccepted {
+		t.Fatalf("expected 202 from api chat, got %d", chatResp.StatusCode)
+	}
+
+	var (
+		doneSeen bool
+		textSeen bool
+	)
+	for !doneSeen {
+		msg := readWorkspaceWSMessage(t, ctx, conn)
+		switch msg.Type {
+		case "text":
+			textSeen = true
+		case "done":
+			doneSeen = true
+		}
+	}
+
+	if !textSeen {
+		t.Fatal("expected websocket client to receive text output from api chat")
 	}
 
 	waitFor(t, 2*time.Second, func() bool {
@@ -320,32 +411,27 @@ func TestWorkspaceTopicWSQueuesPrompt(t *testing.T) {
 	})
 
 	lastRequest := predictable.GetLastRequest()
-	var userTexts []string
+	if lastRequest == nil {
+		t.Fatal("expected predictable model request")
+	}
+
+	found := false
 	for _, msg := range lastRequest.Messages {
 		if msg.Role != llm.MessageRoleUser {
 			continue
 		}
 		for _, content := range msg.Content {
-			if content.Type == llm.ContentTypeText {
-				userTexts = append(userTexts, content.Text)
+			if content.Type == llm.ContentTypeText && content.Text == "echo: from api" {
+				found = true
 			}
 		}
 	}
-
-	if len(userTexts) < 2 {
-		t.Fatalf("expected both prompts in the LLM request, got %#v", userTexts)
-	}
-	if userTexts[len(userTexts)-2] != "echo: first" || userTexts[len(userTexts)-1] != "echo: second" {
-		t.Fatalf("expected queued prompts to be preserved in order, got %#v", userTexts)
+	if !found {
+		t.Fatalf("expected api chat prompt in predictable request, got %#v", lastRequest.Messages)
 	}
 }
 
 func TestEmitWorkspaceWSMessagesTranslatesToolLifecycle(t *testing.T) {
-	server, _, _ := newTestServer(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	outCh := make(chan workspaceWSMessage, 8)
 	toolTitles := make(map[string]string)
 
 	assistantRaw, err := json.Marshal(llm.Message{
@@ -359,12 +445,18 @@ func TestEmitWorkspaceWSMessagesTranslatesToolLifecycle(t *testing.T) {
 	}
 	assistantRawStr := string(assistantRaw)
 
-	server.emitWorkspaceWSMessagesForAPIMessage(ctx, outCh, toolTitles, APIMessage{
+	messages, turnComplete := translateWorkspaceWSMessagesForAPIMessage(toolTitles, APIMessage{
 		Type:    string(dbpkg.MessageTypeAgent),
 		LlmData: &assistantRawStr,
 	})
+	if turnComplete {
+		t.Fatal("did not expect tool use message to end the turn")
+	}
 
-	toolCall := <-outCh
+	if len(messages) != 1 {
+		t.Fatalf("expected one translated message, got %#v", messages)
+	}
+	toolCall := messages[0]
 	if toolCall.Type != "tool_call" || toolCall.ToolCallID != "tool-1" || toolCall.Title != "bash" {
 		t.Fatalf("unexpected tool_call message: %#v", toolCall)
 	}
@@ -380,12 +472,18 @@ func TestEmitWorkspaceWSMessagesTranslatesToolLifecycle(t *testing.T) {
 	}
 	toolRawStr := string(toolRaw)
 
-	server.emitWorkspaceWSMessagesForAPIMessage(ctx, outCh, toolTitles, APIMessage{
+	messages, turnComplete = translateWorkspaceWSMessagesForAPIMessage(toolTitles, APIMessage{
 		Type:    string(dbpkg.MessageTypeTool),
 		LlmData: &toolRawStr,
 	})
+	if turnComplete {
+		t.Fatal("did not expect tool result to end the turn")
+	}
 
-	toolUpdate := <-outCh
+	if len(messages) != 1 {
+		t.Fatalf("expected one translated tool result message, got %#v", messages)
+	}
+	toolUpdate := messages[0]
 	if toolUpdate.Type != "tool_update" || toolUpdate.ToolCallID != "tool-1" || toolUpdate.Title != "bash" || toolUpdate.Status != "completed" {
 		t.Fatalf("unexpected tool_update message: %#v", toolUpdate)
 	}
@@ -433,4 +531,22 @@ func getWorkspaceTopicInfo(t *testing.T, url string) workspaceTopicInfo {
 		t.Fatalf("failed to decode topic info: %v", err)
 	}
 	return info
+}
+
+func lastUserText(req *llm.Request) string {
+	if req == nil {
+		return ""
+	}
+	for i := len(req.Messages) - 1; i >= 0; i-- {
+		msg := req.Messages[i]
+		if msg.Role != llm.MessageRoleUser {
+			continue
+		}
+		for _, content := range msg.Content {
+			if content.Type == llm.ContentTypeText {
+				return content.Text
+			}
+		}
+	}
+	return ""
 }

@@ -644,6 +644,27 @@ func (s *Server) handleChatConversation(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
+	userEmail := r.Header.Get("X-ExeDev-Email")
+	if topic := s.topicManager.GetTopicByConversationID(conversationID); topic != nil {
+		if req.Model != "" {
+			topicModelID := conversationModelID(*topic.Conversation, topic.Config.ModelID)
+			if topicModelID != "" && req.Model != topicModelID {
+				http.Error(w, fmt.Errorf("%w: conversation already uses model %s; requested %s", errConversationModelMismatch, topicModelID, req.Model).Error(), http.StatusBadRequest)
+				return
+			}
+		}
+
+		senderID := userEmail
+		if senderID == "" {
+			senderID = "api"
+		}
+		topic.EnqueuePrompt(req.Message, senderID)
+
+		w.WriteHeader(http.StatusAccepted)
+		json.NewEncoder(w).Encode(map[string]string{"status": "accepted"})
+		return
+	}
+
 	// Get LLM service for the requested model
 	modelID := req.Model
 	if modelID == "" {
@@ -656,8 +677,6 @@ func (s *Server) handleChatConversation(w http.ResponseWriter, r *http.Request, 
 		http.Error(w, fmt.Sprintf("Unsupported model: %s", modelID), http.StatusBadRequest)
 		return
 	}
-
-	userEmail := r.Header.Get("X-ExeDev-Email")
 
 	// Get or create conversation manager
 	manager, err := s.getOrCreateConversationManager(ctx, conversationID, userEmail)

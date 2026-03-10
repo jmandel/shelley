@@ -221,7 +221,7 @@ type Server struct {
 	llmManager          LLMProvider
 	toolSetConfig       claudetool.ToolSetConfig
 	activeConversations map[string]*ConversationManager
-	topicClientCounts   map[string]int
+	topicManager        *TopicManager
 	mu                  sync.Mutex
 	logger              *slog.Logger
 	predictableOnly     bool
@@ -245,7 +245,6 @@ func NewServer(database *db.DB, llmManager LLMProvider, toolSetConfig claudetool
 		llmManager:          llmManager,
 		toolSetConfig:       toolSetConfig,
 		activeConversations: make(map[string]*ConversationManager),
-		topicClientCounts:   make(map[string]int),
 		logger:              logger,
 		predictableOnly:     predictableOnly,
 		terminalURL:         terminalURL,
@@ -263,6 +262,7 @@ func NewServer(database *db.DB, llmManager LLMProvider, toolSetConfig claudetool
 	s.toolSetConfig.SubagentRunner = NewSubagentRunner(s)
 	s.toolSetConfig.SubagentDB = &db.SubagentDBAdapter{DB: database}
 	s.toolSetConfig.MaxSubagentDepth = 1 // Only top-level conversations can spawn subagents
+	s.topicManager = NewTopicManager(s, logger)
 
 	return s
 }
