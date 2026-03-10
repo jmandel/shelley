@@ -234,6 +234,8 @@ type Server struct {
 	notifDispatcher     *notifications.Dispatcher
 	shutdownCh          chan struct{} // Signals background routines to stop
 	listenPort          int           // TCP port the server is listening on
+	workspaceName       string
+	startedAt           time.Time
 }
 
 // NewServer creates a new server instance
@@ -253,6 +255,8 @@ func NewServer(database *db.DB, llmManager LLMProvider, toolSetConfig claudetool
 		versionChecker:      NewVersionChecker(),
 		notifDispatcher:     notifications.NewDispatcher(logger),
 		shutdownCh:          make(chan struct{}),
+		workspaceName:       defaultWorkspaceName(),
+		startedAt:           time.Now(),
 	}
 
 	// Set up subagent support
@@ -278,6 +282,16 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.Handle("DELETE /topics/{name}", http.HandlerFunc(s.handleWorkspaceTopic))
 	mux.Handle("GET /acp", http.HandlerFunc(s.handleWorkspaceTopicQueryWS))
 	mux.Handle("GET /acp/{topic}", http.HandlerFunc(s.handleWorkspaceTopicWS))
+	mux.Handle("GET /ws/health", http.HandlerFunc(s.handleWorkspaceHealth))
+	mux.Handle("GET /ws/topics", http.HandlerFunc(s.handleWorkspaceTopics))
+	mux.Handle("POST /ws/topics", http.HandlerFunc(s.handleWorkspaceTopics))
+	mux.Handle("GET /ws/topics/{name}", http.HandlerFunc(s.handleWorkspaceTopic))
+	mux.Handle("DELETE /ws/topics/{name}", http.HandlerFunc(s.handleWorkspaceTopic))
+	mux.Handle("GET /ws/acp", http.HandlerFunc(s.handleWorkspaceTopicQueryWS))
+	mux.Handle("GET /ws/acp/{topic}", http.HandlerFunc(s.handleWorkspaceTopicWS))
+	mux.Handle("GET /workspaces", http.HandlerFunc(s.handleWorkspaceManager))
+	mux.Handle("POST /workspaces", http.HandlerFunc(s.handleWorkspaceManager))
+	mux.Handle("GET /workspaces/{name}", http.HandlerFunc(s.handleWorkspaceManagerWorkspace))
 
 	// API routes - wrap with gzip where beneficial
 	mux.Handle("/api/conversations", gzipHandler(http.HandlerFunc(s.handleConversations)))

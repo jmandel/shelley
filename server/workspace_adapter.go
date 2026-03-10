@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -50,6 +52,14 @@ type workspacePromptMessage struct {
 	Data string `json:"data,omitempty"`
 }
 
+type workspaceManagerInfo struct {
+	Name      string `json:"name"`
+	Status    string `json:"status"`
+	ACP       string `json:"acp"`
+	API       string `json:"api,omitempty"`
+	CreatedAt string `json:"createdAt"`
+}
+
 type topicConversationState int
 
 const (
@@ -73,10 +83,75 @@ func (s *Server) handleWorkspaceHealth(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
-		"status":    "ok",
-		"hasApiKey": s.defaultTopicModelID() != "",
-		"topics":    topics,
+		"status":        "ok",
+		"mode":          "workspace",
+		"workspaceName": s.workspaceName,
+		"hasApiKey":     s.defaultTopicModelID() != "",
+		"topics":        topics,
 	})
+}
+
+func (s *Server) handleWorkspaceManager(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode([]workspaceManagerInfo{s.workspaceManagerInfo(r)})
+	case http.MethodPost:
+		var req struct {
+			Name   string   `json:"name"`
+			Topics []string `json:"topics"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid JSON", http.StatusBadRequest)
+			return
+		}
+		if req.Name == "" {
+			http.Error(w, "name required", http.StatusBadRequest)
+			return
+		}
+		if req.Name != s.workspaceName {
+			http.Error(w, "single-workspace server: name does not match running workspace", http.StatusConflict)
+			return
+		}
+		for _, topic := range req.Topics {
+			topicName, err := sanitizeTopicName(topic)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if _, _, err := s.getOrCreateTopicConversation(r.Context(), topicName); err != nil && !errors.Is(err, errTopicAlreadyExists) {
+				s.logger.Error("Failed to pre-create topic from workspace manager request", "topic", topicName, "error", err)
+				http.Error(w, "Internal server error", http.StatusInternalServerError)
+				return
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		resp := s.workspaceManagerInfo(r)
+		type workspaceCreateResponse struct {
+			workspaceManagerInfo
+			Topics []string `json:"topics,omitempty"`
+		}
+		json.NewEncoder(w).Encode(workspaceCreateResponse{
+			workspaceManagerInfo: resp,
+			Topics:               req.Topics,
+		})
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleWorkspaceManagerWorkspace(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if r.PathValue("name") != s.workspaceName {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(s.workspaceManagerInfo(r))
 }
 
 func (s *Server) handleWorkspaceTopics(w http.ResponseWriter, r *http.Request) {
@@ -662,4 +737,38 @@ func workspaceTopicACPURL(r *http.Request, topicName string) string {
 		scheme = "wss"
 	}
 	return fmt.Sprintf("%s://%s/acp/%s", scheme, r.Host, url.PathEscape(topicName))
+}
+
+func workspaceBaseURLs(r *http.Request) (apiURL, acpURL string) {
+	scheme := "http"
+	wsScheme := "ws"
+	if r.TLS != nil {
+		scheme = "https"
+		wsScheme = "wss"
+	}
+	return fmt.Sprintf("%s://%s", scheme, r.Host), fmt.Sprintf("%s://%s/acp", wsScheme, r.Host)
+}
+
+func (s *Server) workspaceManagerInfo(r *http.Request) workspaceManagerInfo {
+	apiURL, acpURL := workspaceBaseURLs(r)
+	return workspaceManagerInfo{
+		Name:      s.workspaceName,
+		Status:    "running",
+		ACP:       acpURL,
+		API:       apiURL,
+		CreatedAt: s.startedAt.Format(time.RFC3339),
+	}
+}
+
+func defaultWorkspaceName() string {
+	if name := strings.TrimSpace(os.Getenv("WORKSPACE_NAME")); name != "" {
+		return slug.Sanitize(name)
+	}
+	wd, err := os.Getwd()
+	if err == nil {
+		if base := slug.Sanitize(filepath.Base(wd)); base != "" {
+			return base
+		}
+	}
+	return "workspace"
 }

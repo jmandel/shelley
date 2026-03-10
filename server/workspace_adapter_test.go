@@ -145,6 +145,116 @@ func TestWorkspaceTopicsLifecycle(t *testing.T) {
 	}
 }
 
+func TestWorkspaceAliasRoutesAndManagerDiscovery(t *testing.T) {
+	server, _, _ := newTestServer(t)
+	server.workspaceName = "test-workspace"
+
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	createReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/ws/topics", bytes.NewBufferString(`{"name":"alias-topic"}`))
+	if err != nil {
+		t.Fatalf("failed to build alias topic create request: %v", err)
+	}
+	createReq.Header.Set("Content-Type", "application/json")
+
+	createResp, err := http.DefaultClient.Do(createReq)
+	if err != nil {
+		t.Fatalf("failed to create alias topic: %v", err)
+	}
+	defer createResp.Body.Close()
+	if createResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 creating /ws topic, got %d", createResp.StatusCode)
+	}
+
+	healthResp, err := http.Get(httpServer.URL + "/ws/health")
+	if err != nil {
+		t.Fatalf("failed to call /ws/health: %v", err)
+	}
+	defer healthResp.Body.Close()
+	if healthResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 from /ws/health, got %d", healthResp.StatusCode)
+	}
+
+	var health struct {
+		Status        string   `json:"status"`
+		Mode          string   `json:"mode"`
+		WorkspaceName string   `json:"workspaceName"`
+		Topics        []string `json:"topics"`
+	}
+	if err := json.NewDecoder(healthResp.Body).Decode(&health); err != nil {
+		t.Fatalf("failed to decode /ws/health response: %v", err)
+	}
+	if health.Mode != "workspace" || health.WorkspaceName != "test-workspace" {
+		t.Fatalf("unexpected /ws/health response: %#v", health)
+	}
+	if len(health.Topics) != 1 || health.Topics[0] != "alias-topic" {
+		t.Fatalf("expected alias-topic in /ws/health topics, got %#v", health.Topics)
+	}
+
+	listResp, err := http.Get(httpServer.URL + "/workspaces")
+	if err != nil {
+		t.Fatalf("failed to call /workspaces: %v", err)
+	}
+	defer listResp.Body.Close()
+	if listResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 from /workspaces, got %d", listResp.StatusCode)
+	}
+
+	var workspaces []workspaceManagerInfo
+	if err := json.NewDecoder(listResp.Body).Decode(&workspaces); err != nil {
+		t.Fatalf("failed to decode /workspaces response: %v", err)
+	}
+	if len(workspaces) != 1 || workspaces[0].Name != "test-workspace" {
+		t.Fatalf("unexpected /workspaces response: %#v", workspaces)
+	}
+	if !strings.HasSuffix(workspaces[0].ACP, "/acp") {
+		t.Fatalf("expected manager acp base URL to end with /acp, got %q", workspaces[0].ACP)
+	}
+
+	getResp, err := http.Get(httpServer.URL + "/workspaces/test-workspace")
+	if err != nil {
+		t.Fatalf("failed to call /workspaces/{name}: %v", err)
+	}
+	defer getResp.Body.Close()
+	if getResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 from /workspaces/{name}, got %d", getResp.StatusCode)
+	}
+
+	var workspace workspaceManagerInfo
+	if err := json.NewDecoder(getResp.Body).Decode(&workspace); err != nil {
+		t.Fatalf("failed to decode /workspaces/{name} response: %v", err)
+	}
+	if workspace.Name != "test-workspace" {
+		t.Fatalf("unexpected workspace info: %#v", workspace)
+	}
+
+	managerCreateReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/workspaces", bytes.NewBufferString(`{"name":"test-workspace","topics":["precreated"]}`))
+	if err != nil {
+		t.Fatalf("failed to build manager create request: %v", err)
+	}
+	managerCreateReq.Header.Set("Content-Type", "application/json")
+	managerCreateResp, err := http.DefaultClient.Do(managerCreateReq)
+	if err != nil {
+		t.Fatalf("failed to post /workspaces: %v", err)
+	}
+	defer managerCreateResp.Body.Close()
+	if managerCreateResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 from /workspaces POST, got %d", managerCreateResp.StatusCode)
+	}
+
+	precreatedResp, err := http.Get(httpServer.URL + "/topics/precreated")
+	if err != nil {
+		t.Fatalf("failed to get precreated topic: %v", err)
+	}
+	defer precreatedResp.Body.Close()
+	if precreatedResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for precreated topic, got %d", precreatedResp.StatusCode)
+	}
+}
+
 func TestWorkspaceTopicWSQueuesPrompt(t *testing.T) {
 	t.Setenv("PREDICTABLE_DELAY_MS", "250")
 
