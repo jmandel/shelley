@@ -287,6 +287,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.Handle("POST /ws/topics", http.HandlerFunc(s.handleWorkspaceTopics))
 	mux.Handle("GET /ws/topics/{name}", http.HandlerFunc(s.handleWorkspaceTopic))
 	mux.Handle("DELETE /ws/topics/{name}", http.HandlerFunc(s.handleWorkspaceTopic))
+	mux.Handle("GET /ws/topic/{name}", http.HandlerFunc(s.handleWorkspaceTopicWSByName))
 	mux.Handle("GET /ws/acp", http.HandlerFunc(s.handleWorkspaceTopicQueryWS))
 	mux.Handle("GET /ws/acp/{topic}", http.HandlerFunc(s.handleWorkspaceTopicWS))
 	mux.Handle("GET /workspaces", http.HandlerFunc(s.handleWorkspaceManager))

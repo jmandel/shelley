@@ -298,6 +298,10 @@ func (s *Server) handleWorkspaceTopicQueryWS(w http.ResponseWriter, r *http.Requ
 	s.handleWorkspaceTopicWSForName(w, r, topicName)
 }
 
+func (s *Server) handleWorkspaceTopicWSByName(w http.ResponseWriter, r *http.Request) {
+	s.handleWorkspaceTopicWSForName(w, r, r.PathValue("name"))
+}
+
 func (s *Server) handleWorkspaceTopicWS(w http.ResponseWriter, r *http.Request) {
 	s.handleWorkspaceTopicWSForName(w, r, r.PathValue("topic"))
 }

@@ -267,7 +267,7 @@ func TestWorkspaceTopicWSQueuesPrompt(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/acp/general"
+	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws/topic/general"
 	conn, _, err := websocket.Dial(ctx, wsURL, nil)
 	if err != nil {
 		t.Fatalf("failed to dial websocket: %v", err)
