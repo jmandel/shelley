@@ -221,6 +221,7 @@ type Server struct {
 	llmManager          LLMProvider
 	toolSetConfig       claudetool.ToolSetConfig
 	activeConversations map[string]*ConversationManager
+	topicClientCounts   map[string]int
 	mu                  sync.Mutex
 	logger              *slog.Logger
 	predictableOnly     bool
@@ -242,6 +243,7 @@ func NewServer(database *db.DB, llmManager LLMProvider, toolSetConfig claudetool
 		llmManager:          llmManager,
 		toolSetConfig:       toolSetConfig,
 		activeConversations: make(map[string]*ConversationManager),
+		topicClientCounts:   make(map[string]int),
 		logger:              logger,
 		predictableOnly:     predictableOnly,
 		terminalURL:         terminalURL,
@@ -269,6 +271,14 @@ func (s *Server) RegisterNotificationChannel(ch notifications.Channel) {
 
 // RegisterRoutes registers HTTP routes on the given mux
 func (s *Server) RegisterRoutes(mux *http.ServeMux) {
+	mux.Handle("GET /health", http.HandlerFunc(s.handleWorkspaceHealth))
+	mux.Handle("GET /topics", http.HandlerFunc(s.handleWorkspaceTopics))
+	mux.Handle("POST /topics", http.HandlerFunc(s.handleWorkspaceTopics))
+	mux.Handle("GET /topics/{name}", http.HandlerFunc(s.handleWorkspaceTopic))
+	mux.Handle("DELETE /topics/{name}", http.HandlerFunc(s.handleWorkspaceTopic))
+	mux.Handle("GET /acp", http.HandlerFunc(s.handleWorkspaceTopicQueryWS))
+	mux.Handle("GET /acp/{topic}", http.HandlerFunc(s.handleWorkspaceTopicWS))
+
 	// API routes - wrap with gzip where beneficial
 	mux.Handle("/api/conversations", gzipHandler(http.HandlerFunc(s.handleConversations)))
 	mux.Handle("/api/conversations/archived", gzipHandler(http.HandlerFunc(s.handleArchivedConversations)))
