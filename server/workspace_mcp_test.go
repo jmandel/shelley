@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
+	"github.com/coder/websocket/wsjson"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"shelley.exe.dev/db"
@@ -193,6 +195,107 @@ func TestWorkspaceToolMCPStreamableHTTPEndToEndTopicTurn(t *testing.T) {
 
 	waitFor(t, 2*time.Second, func() bool {
 		return topicHasToolResultText(t, database, sessionID, "Hi Shelley")
+	})
+}
+
+func TestWorkspaceToolMCPApprovalExecutesAfterApproval(t *testing.T) {
+	server, database, _ := newTestServer(t)
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	mcpServer := newWorkspaceMCPTestServer(func(args map[string]any) (*mcp.CallToolResult, any, error) {
+		name, _ := args["name"].(string)
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.TextContent{Text: "Approved hi " + name},
+			},
+		}, nil, nil
+	})
+	transportServer := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
+		return mcpServer
+	}, &mcp.StreamableHTTPOptions{DisableLocalhostProtection: true}))
+	defer transportServer.Close()
+
+	createWorkspaceTool(t, httpServer.URL, `{
+		"name":"approval-greeter",
+		"actions":["greet"],
+		"config":{
+			"transport":"streamable_http",
+			"endpoint":"`+transportServer.URL+`",
+			"disableStandaloneSSE":true
+		}
+	}`)
+	createWorkspaceGrant(t, httpServer.URL, "approval-greeter", `{
+		"subject":"agent:*",
+		"actions":["greet"],
+		"access":"approval_required",
+		"approvers":["alice@example.com"]
+	}`)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	wsURL := "ws" + httpServer.URL[len("http"):] + "/ws/topic/mcp-approval"
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("failed to dial workspace websocket: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "test complete")
+
+	waitForConnectedMessage(t, ctx, conn)
+	sessionID := getWorkspaceTopicInfo(t, httpServer.URL+"/topics/mcp-approval").SessionID
+
+	if err := wsjson.Write(ctx, conn, workspacePromptMessage{
+		Type: "prompt",
+		Data: `workspace_tool_json: approval-greeter greet {"name":"Shelley"}`,
+	}); err != nil {
+		t.Fatalf("failed to send approval workspace prompt: %v", err)
+	}
+
+	var (
+		approvalRequest workspaceWSMessage
+	)
+	for {
+		msg := readWorkspaceWSMessage(t, ctx, conn)
+		if msg.Type == "approval_request" {
+			approvalRequest = msg
+			break
+		}
+	}
+
+	if approvalRequest.Tool != "approval-greeter" || approvalRequest.Action != "greet" || approvalRequest.ToolCallID == "" {
+		t.Fatalf("unexpected approval request: %#v", approvalRequest)
+	}
+
+	if err := wsjson.Write(ctx, conn, workspacePromptMessage{
+		Type:       "approval_response",
+		ToolCallID: approvalRequest.ToolCallID,
+		Approved:   true,
+		Approver:   "alice@example.com",
+	}); err != nil {
+		t.Fatalf("failed to send approval response: %v", err)
+	}
+
+	var toolCalled bool
+	var received []workspaceWSMessage
+	for {
+		msg := readWorkspaceWSMessage(t, ctx, conn)
+		received = append(received, msg)
+		if msg.Type == "tool_call" && msg.Title == "workspace_approval-greeter" {
+			toolCalled = true
+		}
+		if msg.Type == "done" {
+			break
+		}
+	}
+	if !toolCalled {
+		t.Fatalf("expected workspace tool call after approval, got %#v", received)
+	}
+
+	waitFor(t, 2*time.Second, func() bool {
+		return topicHasToolResultText(t, database, sessionID, "Approved hi Shelley")
 	})
 }
 
