@@ -20,7 +20,8 @@ const (
 )
 
 type workspaceToolInvocation struct {
-	Action string `json:"action"`
+	Action string          `json:"action"`
+	Input  json.RawMessage `json:"input,omitempty"`
 }
 
 func isValidWorkspaceGrantAccess(access string) bool {
@@ -161,7 +162,7 @@ func (s *Server) runWorkspaceTool(ctx context.Context, topicName string, toolRec
 		if err := s.recordWorkspaceToolLog(ctx, toolRecord, topicName, req.Action, subject, decision, "", input); err != nil {
 			return llm.ToolOut{Error: err}
 		}
-		return llm.ToolOut{Error: fmt.Errorf("workspace tool execution not implemented for %s/%s", toolRecord.Name, req.Action)}
+		return s.executeWorkspaceTool(ctx, toolRecord, req)
 	case workspaceGrantApprovalRequired:
 		approved, approver, err := s.requestWorkspaceToolApproval(ctx, topicName, toolRecord, req.Action, approvalApprovers[req.Action], input)
 		if err != nil {
@@ -176,7 +177,7 @@ func (s *Server) runWorkspaceTool(ctx context.Context, topicName string, toolRec
 		if err := s.recordWorkspaceToolLog(ctx, toolRecord, topicName, req.Action, subject, "approved", approver, input); err != nil {
 			return llm.ToolOut{Error: err}
 		}
-		return llm.ToolOut{Error: fmt.Errorf("workspace tool execution not implemented for %s/%s", toolRecord.Name, req.Action)}
+		return s.executeWorkspaceTool(ctx, toolRecord, req)
 	case workspaceGrantDenied:
 		if err := s.recordWorkspaceToolLog(ctx, toolRecord, topicName, req.Action, subject, decision, "", input); err != nil {
 			return llm.ToolOut{Error: err}
@@ -187,6 +188,15 @@ func (s *Server) runWorkspaceTool(ctx context.Context, topicName string, toolRec
 			return llm.ToolOut{Error: err}
 		}
 		return llm.ToolOut{Error: fmt.Errorf("no grant for %s/%s", toolRecord.Name, req.Action)}
+	}
+}
+
+func (s *Server) executeWorkspaceTool(ctx context.Context, toolRecord generated.WorkspaceTool, req workspaceToolInvocation) llm.ToolOut {
+	switch strings.ToLower(strings.TrimSpace(toolRecord.Protocol)) {
+	case "mcp":
+		return s.executeMCPWorkspaceTool(ctx, toolRecord, req)
+	default:
+		return llm.ToolOut{Error: fmt.Errorf("workspace tool protocol not implemented: %s", toolRecord.Protocol)}
 	}
 }
 
