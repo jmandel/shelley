@@ -69,6 +69,35 @@ func TestQueueUserMessage(t *testing.T) {
 	}
 }
 
+func TestQueueUserMessageWithCallback(t *testing.T) {
+	loop := NewLoop(Config{
+		LLM:     NewPredictableService(),
+		History: []llm.Message{},
+		Tools:   []*llm.Tool{},
+		RecordMessage: func(ctx context.Context, message llm.Message, usage llm.Usage) error {
+			return nil
+		},
+	})
+
+	delivered := make(chan struct{}, 1)
+	loop.QueueUserMessageWithCallback(llm.Message{
+		Role:    llm.MessageRoleUser,
+		Content: []llm.Content{{Type: llm.ContentTypeText, Text: "queued with callback"}},
+	}, func() {
+		delivered <- struct{}{}
+	})
+
+	if err := loop.ProcessOneTurn(context.Background()); err != nil {
+		t.Fatalf("ProcessOneTurn failed: %v", err)
+	}
+
+	select {
+	case <-delivered:
+	case <-time.After(time.Second):
+		t.Fatal("expected delivery callback to fire")
+	}
+}
+
 func TestPredictableService(t *testing.T) {
 	service := NewPredictableService()
 
@@ -323,8 +352,40 @@ func TestPredictableServiceWSHelp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ws help failed: %v", err)
 	}
-	if got := resp.Content[0].Text; !strings.Contains(got, "Primary actions:") || !strings.Contains(got, "toolpause3") || !strings.Contains(got, "Whole demo commands:") || !strings.Contains(got, "The hard validator errors are gone.") {
+	if got := resp.Content[0].Text; !strings.Contains(got, "Show this guide:") || !strings.Contains(got, "Syntax:") || !strings.Contains(got, "toolpause3") || !strings.Contains(got, "Whole demo commands:") || !strings.Contains(got, "The hard validator errors are gone.") {
 		t.Fatalf("unexpected ws help response %q", got)
+	}
+}
+
+func TestPredictableServiceWSBareShowsFullGuide(t *testing.T) {
+	service := NewPredictableService()
+
+	resp, err := service.Do(context.Background(), &llm.Request{
+		Messages: []llm.Message{
+			{Role: llm.MessageRoleUser, Content: []llm.Content{{Type: llm.ContentTypeText, Text: "ws"}}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ws bare guide failed: %v", err)
+	}
+	if got := resp.Content[0].Text; !strings.Contains(got, "Show this guide:") || !strings.Contains(got, "ws help") || !strings.Contains(got, "Syntax:") {
+		t.Fatalf("unexpected bare ws response %q", got)
+	}
+}
+
+func TestPredictableServiceWSUsageErrorShowsFullGuide(t *testing.T) {
+	service := NewPredictableService()
+
+	resp, err := service.Do(context.Background(), &llm.Request{
+		Messages: []llm.Message{
+			{Role: llm.MessageRoleUser, Content: []llm.Content{{Type: llm.ContentTypeText, Text: `ws nope "bad"`}}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ws invalid usage failed: %v", err)
+	}
+	if got := resp.Content[0].Text; !strings.Contains(got, `WS usage error: unknown ws tag "nope"`) || !strings.Contains(got, "Syntax:") || !strings.Contains(got, "ws tool <tool-name> action <action-name> [input <json>]") {
+		t.Fatalf("unexpected ws usage error response %q", got)
 	}
 }
 

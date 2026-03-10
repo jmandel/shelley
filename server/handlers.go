@@ -665,7 +665,7 @@ func (s *Server) handleChatConversation(w http.ResponseWriter, r *http.Request, 
 		if senderID == "" {
 			senderID = "api"
 		}
-		prompt := topic.EnqueuePrompt("", req.Message, senderID)
+		prompt := topic.EnqueuePrompt("", req.Message, senderID, nil)
 
 		w.WriteHeader(http.StatusAccepted)
 		json.NewEncoder(w).Encode(map[string]string{"status": "accepted", "promptId": prompt.PromptID})

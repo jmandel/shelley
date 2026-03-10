@@ -37,7 +37,7 @@ func (t *Topic) RequestApproval(ctx context.Context, req workspaceApprovalReques
 		t.approvalMu.Unlock()
 	}()
 
-	t.WSHub.Broadcast(workspaceWSMessage{
+	t.broadcastWSMessage(workspaceWSMessage{
 		Type:       "approval_request",
 		ToolCallID: req.ToolCallID,
 		Tool:       req.Tool,

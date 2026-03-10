@@ -68,6 +68,21 @@ func (pq *PromptQueue) Enqueue(prompt QueuedPrompt) int {
 	return position
 }
 
+func (pq *PromptQueue) EnqueueFront(prompt QueuedPrompt) int {
+	pq.mu.Lock()
+	defer pq.mu.Unlock()
+
+	prompt.Status = PromptStatusQueued
+	pq.queue = append([]QueuedPrompt{prompt}, pq.queue...)
+
+	select {
+	case pq.notify <- struct{}{}:
+	default:
+	}
+
+	return 1
+}
+
 func (pq *PromptQueue) WaitForNext(ctx context.Context) (QueuedPrompt, bool) {
 	for {
 		pq.mu.Lock()
@@ -240,6 +255,16 @@ func (pq *PromptQueue) ActivePromptID() string {
 		return ""
 	}
 	return pq.active.PromptID
+}
+
+func (pq *PromptQueue) Active() (QueuedPrompt, bool) {
+	pq.mu.Lock()
+	defer pq.mu.Unlock()
+
+	if pq.active == nil {
+		return QueuedPrompt{}, false
+	}
+	return *pq.active, true
 }
 
 func (pq *PromptQueue) Len() int {

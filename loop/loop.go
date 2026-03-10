@@ -44,7 +44,7 @@ type Loop struct {
 	tools            []*llm.Tool
 	recordMessage    MessageRecordFunc
 	history          []llm.Message
-	messageQueue     []llm.Message
+	messageQueue     []queuedUserMessage
 	totalUsage       llm.Usage
 	mu               sync.Mutex
 	logger           *slog.Logger
@@ -53,6 +53,11 @@ type Loop struct {
 	onGitStateChange GitStateChangeFunc
 	getWorkingDir    func() string
 	lastGitState     *gitstate.GitState
+}
+
+type queuedUserMessage struct {
+	message     llm.Message
+	onDelivered func()
 }
 
 // NewLoop creates a new Loop instance with the provided configuration
@@ -74,7 +79,7 @@ func NewLoop(config Config) *Loop {
 		history:          config.History,
 		tools:            config.Tools,
 		recordMessage:    config.RecordMessage,
-		messageQueue:     make([]llm.Message, 0),
+		messageQueue:     make([]queuedUserMessage, 0),
 		logger:           logger,
 		system:           config.System,
 		workingDir:       config.WorkingDir,
@@ -86,9 +91,18 @@ func NewLoop(config Config) *Loop {
 
 // QueueUserMessage adds a user message to the queue to be processed
 func (l *Loop) QueueUserMessage(message llm.Message) {
+	l.QueueUserMessageWithCallback(message, nil)
+}
+
+// QueueUserMessageWithCallback adds a user message to the queue and invokes the
+// callback when the message has been added to the loop history at a safe point.
+func (l *Loop) QueueUserMessageWithCallback(message llm.Message, onDelivered func()) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.messageQueue = append(l.messageQueue, message)
+	l.messageQueue = append(l.messageQueue, queuedUserMessage{
+		message:     message,
+		onDelivered: onDelivered,
+	})
 	l.logger.Debug("queued user message", "content_count", len(message.Content))
 }
 
@@ -141,17 +155,13 @@ func (l *Loop) Go(ctx context.Context) error {
 		default:
 		}
 
-		// Process any queued messages
-		l.mu.Lock()
-		hasQueuedMessages := len(l.messageQueue) > 0
-		if hasQueuedMessages {
-			// Add queued messages to history (they are already recorded to DB by ConversationManager)
-			for _, msg := range l.messageQueue {
-				l.history = append(l.history, msg)
+		queuedCallbacks := l.drainQueuedMessagesToHistory()
+		hasQueuedMessages := len(queuedCallbacks) > 0
+		for _, callback := range queuedCallbacks {
+			if callback != nil {
+				callback()
 			}
-			l.messageQueue = l.messageQueue[:0] // Clear queue
 		}
-		l.mu.Unlock()
 
 		if hasQueuedMessages {
 			// Send request to LLM
@@ -181,16 +191,12 @@ func (l *Loop) ProcessOneTurn(ctx context.Context) error {
 		return fmt.Errorf("no LLM service configured")
 	}
 
-	// Process any queued messages first
-	l.mu.Lock()
-	if len(l.messageQueue) > 0 {
-		// Add queued messages to history (they are already recorded to DB by ConversationManager)
-		for _, msg := range l.messageQueue {
-			l.history = append(l.history, msg)
+	queuedCallbacks := l.drainQueuedMessagesToHistory()
+	for _, callback := range queuedCallbacks {
+		if callback != nil {
+			callback()
 		}
-		l.messageQueue = nil
 	}
-	l.mu.Unlock()
 
 	// Process one LLM request and response
 	return l.processLLMRequest(ctx)
@@ -498,16 +504,17 @@ func (l *Loop) executeToolCalls(ctx context.Context, content []llm.Content) erro
 
 		l.mu.Lock()
 		l.history = append(l.history, toolMessage)
-		// Check for queued user messages (interruptions) before continuing.
-		// This allows user messages to be processed as soon as possible.
-		if len(l.messageQueue) > 0 {
-			for _, msg := range l.messageQueue {
-				l.history = append(l.history, msg)
-			}
-			l.messageQueue = l.messageQueue[:0]
+		l.mu.Unlock()
+
+		queuedCallbacks := l.drainQueuedMessagesToHistory()
+		if len(queuedCallbacks) > 0 {
 			l.logger.Info("processing user interruption during tool execution")
 		}
-		l.mu.Unlock()
+		for _, callback := range queuedCallbacks {
+			if callback != nil {
+				callback()
+			}
+		}
 
 		// Record tool result message
 		if err := l.recordMessage(ctx, toolMessage, llm.Usage{}); err != nil {
@@ -516,6 +523,23 @@ func (l *Loop) executeToolCalls(ctx context.Context, content []llm.Content) erro
 	}
 
 	return nil
+}
+
+func (l *Loop) drainQueuedMessagesToHistory() []func() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if len(l.messageQueue) == 0 {
+		return nil
+	}
+
+	callbacks := make([]func(), 0, len(l.messageQueue))
+	for _, queued := range l.messageQueue {
+		l.history = append(l.history, queued.message)
+		callbacks = append(callbacks, queued.onDelivered)
+	}
+	l.messageQueue = l.messageQueue[:0]
+	return callbacks
 }
 
 // insertMissingToolResults fixes tool_result issues in the conversation history:

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -545,7 +546,7 @@ func TestWorkspaceTopicQueueRESTUpdateAndMove(t *testing.T) {
 			snapshot.Entries[1].PromptID == "p-3"
 	})
 
-	updateReq, err := http.NewRequest(http.MethodPatch, httpServer.URL+"/ws/topics/queue-edit/queue/p-3", bytes.NewBufferString(`{"text":"echo: revised third"}`))
+	updateReq, err := http.NewRequest(http.MethodPatch, httpServer.URL+"/ws/topics/queue-edit/queue/p-3", bytes.NewBufferString(`{"data":"echo: revised third"}`))
 	if err != nil {
 		t.Fatalf("failed to build queue patch request: %v", err)
 	}
@@ -642,6 +643,425 @@ func TestWorkspaceTopicQueueRESTUpdateAndMove(t *testing.T) {
 		if msg.Type == "queue_entry_moved" && msg.PromptID == "p-3" && msg.Direction == "bottom" && msg.Position == 2 {
 			bottomSeen = true
 		}
+	}
+}
+
+func TestWorkspaceTopicPromptPositionFront(t *testing.T) {
+	t.Setenv("PREDICTABLE_DELAY_MS", "250")
+
+	server, _, predictable := newTestServer(t)
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws/topic/queue-front?client_id=cli-a"
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("failed to dial websocket: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "test complete")
+	waitForConnectedMessage(t, ctx, conn)
+
+	front := 0
+	for _, prompt := range []workspacePromptMessage{
+		{Type: "prompt", PromptID: "p-1", Data: "echo: first"},
+		{Type: "prompt", PromptID: "p-2", Data: "echo: second"},
+		{Type: "prompt", PromptID: "p-3", Data: "echo: third", Position: &front},
+	} {
+		if err := wsjson.Write(ctx, conn, prompt); err != nil {
+			t.Fatalf("failed to enqueue %s: %v", prompt.PromptID, err)
+		}
+	}
+
+	var (
+		thirdAccepted bool
+		thirdQueued   bool
+		donePrompts   []string
+	)
+
+	for len(donePrompts) < 3 {
+		msg := readWorkspaceWSMessage(t, ctx, conn)
+		switch msg.Type {
+		case "prompt_status":
+			if msg.PromptID == "p-3" && msg.Status == string(PromptStatusAccepted) && msg.Data == "echo: third" && msg.Position == 1 {
+				thirdAccepted = true
+			}
+			if msg.PromptID == "p-3" && msg.Status == string(PromptStatusQueued) && msg.Position == 1 {
+				thirdQueued = true
+			}
+		case "done":
+			donePrompts = append(donePrompts, msg.PromptID)
+		}
+	}
+
+	if !thirdAccepted {
+		t.Fatal("expected accepted event for p-3 to include prompt text at queue position 1")
+	}
+	if !thirdQueued {
+		t.Fatal("expected p-3 to be queued at the front")
+	}
+	if got := strings.Join(donePrompts, ","); got != "p-1,p-3,p-2" {
+		t.Fatalf("expected done order p-1,p-3,p-2, got %s", got)
+	}
+
+	waitFor(t, 2*time.Second, func() bool {
+		return len(predictable.GetRecentRequests()) >= 3
+	})
+
+	requests := predictable.GetRecentRequests()
+	if len(requests) < 3 {
+		t.Fatalf("expected at least three LLM requests, got %d", len(requests))
+	}
+	if got := lastUserText(requests[len(requests)-3]); got != "echo: first" {
+		t.Fatalf("expected first prompt to run first, got %q", got)
+	}
+	if got := lastUserText(requests[len(requests)-2]); got != "echo: third" {
+		t.Fatalf("expected front-inserted prompt to run second, got %q", got)
+	}
+	if got := lastUserText(requests[len(requests)-1]); got != "echo: second" {
+		t.Fatalf("expected originally queued prompt to run last, got %q", got)
+	}
+}
+
+func TestWorkspaceTopicInjectDuringActiveTurn(t *testing.T) {
+	server, _, predictable := newTestServer(t)
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws/topic/inject-live?client_id=cli-a"
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("failed to dial websocket: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "test complete")
+	waitForConnectedMessage(t, ctx, conn)
+
+	if err := wsjson.Write(ctx, conn, workspacePromptMessage{
+		Type:     "prompt",
+		PromptID: "p-1",
+		Data:     `ws bash "printf primary" toolpause0.2 aftertext "Primary turn complete."`,
+	}); err != nil {
+		t.Fatalf("failed to send primary prompt: %v", err)
+	}
+
+	for {
+		msg := readWorkspaceWSMessage(t, ctx, conn)
+		if msg.Type == "tool_call" {
+			break
+		}
+	}
+
+	if err := wsjson.Write(ctx, conn, workspacePromptMessage{
+		Type:     "inject",
+		InjectID: "inj-1",
+		Data:     `ws text "Injected guidance acknowledged."`,
+	}); err != nil {
+		t.Fatalf("failed to inject prompt: %v", err)
+	}
+
+	var (
+		acceptedSeen  bool
+		deliveredSeen bool
+		injectedSeen  bool
+		textSeen      bool
+		doneSeen      bool
+	)
+
+	for !(acceptedSeen && deliveredSeen && injectedSeen && textSeen && doneSeen) {
+		msg := readWorkspaceWSMessage(t, ctx, conn)
+		switch msg.Type {
+		case "inject_status":
+			if msg.InjectID == "inj-1" && msg.Status == "accepted" {
+				acceptedSeen = true
+			}
+			if msg.InjectID == "inj-1" && msg.Status == "delivered" {
+				deliveredSeen = true
+			}
+		case "user":
+			if msg.InjectID == "inj-1" && msg.Injected && msg.PromptID == "p-1" && msg.Data == `ws text "Injected guidance acknowledged."` {
+				injectedSeen = true
+			}
+		case "text":
+			if msg.Data == "Injected guidance acknowledged." {
+				textSeen = true
+			}
+		case "done":
+			if msg.PromptID == "p-1" && msg.Status == "completed" {
+				doneSeen = true
+			}
+		}
+	}
+
+	waitFor(t, 2*time.Second, func() bool {
+		return len(predictable.GetRecentRequests()) >= 2
+	})
+
+	requests := predictable.GetRecentRequests()
+	if len(requests) < 2 {
+		t.Fatalf("expected at least two LLM requests, got %d", len(requests))
+	}
+	if got := lastUserText(requests[len(requests)-1]); got != `ws text "Injected guidance acknowledged."` {
+		t.Fatalf("expected injected prompt to become the latest user message, got %q", got)
+	}
+}
+
+func TestWorkspaceTopicInjectRESTConflictWhenIdle(t *testing.T) {
+	server, _, _ := newTestServer(t)
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	createReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/ws/topics", bytes.NewBufferString(`{"name":"inject-idle"}`))
+	if err != nil {
+		t.Fatalf("failed to build topic create request: %v", err)
+	}
+	createReq.Header.Set("Content-Type", "application/json")
+	createResp, err := http.DefaultClient.Do(createReq)
+	if err != nil {
+		t.Fatalf("failed to create topic: %v", err)
+	}
+	createResp.Body.Close()
+	if createResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 from create topic, got %d", createResp.StatusCode)
+	}
+
+	injectReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/ws/topics/inject-idle/inject", bytes.NewBufferString(`{"data":"hello"}`))
+	if err != nil {
+		t.Fatalf("failed to build inject request: %v", err)
+	}
+	injectReq.Header.Set("Content-Type", "application/json")
+	injectReq.Header.Set("X-Workspace-Client-ID", "cli-a")
+	injectResp, err := http.DefaultClient.Do(injectReq)
+	if err != nil {
+		t.Fatalf("failed to post inject request: %v", err)
+	}
+	defer injectResp.Body.Close()
+	if injectResp.StatusCode != http.StatusConflict {
+		body, _ := io.ReadAll(injectResp.Body)
+		t.Fatalf("expected 409 from inject when idle, got %d: %s", injectResp.StatusCode, string(body))
+	}
+
+	var rejected workspaceWSMessage
+	if err := json.NewDecoder(injectResp.Body).Decode(&rejected); err != nil {
+		t.Fatalf("failed to decode inject rejection: %v", err)
+	}
+	if rejected.Status != "rejected" || rejected.Reason != "no_active_turn" {
+		t.Fatalf("unexpected inject rejection %#v", rejected)
+	}
+}
+
+func TestWorkspaceTopicInjectDoesNotAckBeforePersistence(t *testing.T) {
+	server, _, predictable := newTestServer(t)
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	createReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/ws/topics", bytes.NewBufferString(`{"name":"inject-persist-fail"}`))
+	if err != nil {
+		t.Fatalf("failed to build topic create request: %v", err)
+	}
+	createReq.Header.Set("Content-Type", "application/json")
+	createResp, err := http.DefaultClient.Do(createReq)
+	if err != nil {
+		t.Fatalf("failed to create topic: %v", err)
+	}
+	createResp.Body.Close()
+	if createResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 from create topic, got %d", createResp.StatusCode)
+	}
+
+	topic, err := server.resolveWorkspaceTopicRuntime(context.Background(), "inject-persist-fail")
+	if err != nil {
+		t.Fatalf("failed to resolve topic runtime: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws/topic/inject-persist-fail?client_id=cli-a"
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("failed to dial websocket: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "test complete")
+	waitForConnectedMessage(t, ctx, conn)
+
+	if err := wsjson.Write(ctx, conn, workspacePromptMessage{
+		Type:     "prompt",
+		PromptID: "p-1",
+		Data:     `ws bash "printf primary" toolpause0.2 aftertext "Primary turn complete."`,
+	}); err != nil {
+		t.Fatalf("failed to send primary prompt: %v", err)
+	}
+
+	for {
+		msg := readWorkspaceWSMessage(t, ctx, conn)
+		if msg.Type == "tool_call" {
+			break
+		}
+	}
+
+	topic.Manager.recordMessageWithUserData = func(context.Context, llm.Message, llm.Usage, ...interface{}) error {
+		return errors.New("persist failed")
+	}
+
+	if err := wsjson.Write(ctx, conn, workspacePromptMessage{
+		Type:     "inject",
+		InjectID: "inj-fail",
+		Data:     `ws text "should never be delivered"`,
+	}); err != nil {
+		t.Fatalf("failed to inject prompt: %v", err)
+	}
+
+	var (
+		acceptedSeen bool
+		rejectedSeen bool
+	)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		msg := readWorkspaceWSMessage(t, ctx, conn)
+		if msg.InjectID != "inj-fail" {
+			continue
+		}
+		if msg.Type == "inject_status" && msg.Status == "accepted" {
+			acceptedSeen = true
+		}
+		if msg.Type == "inject_status" && msg.Status == "rejected" && msg.Reason == "inject_failed" {
+			rejectedSeen = true
+			break
+		}
+	}
+
+	if acceptedSeen {
+		t.Fatal("unexpected inject accepted event before persistence succeeded")
+	}
+	if !rejectedSeen {
+		t.Fatal("expected inject rejection when persistence fails")
+	}
+
+	waitFor(t, time.Second, func() bool {
+		return len(predictable.GetRecentRequests()) >= 1
+	})
+	if got := len(predictable.GetRecentRequests()); got != 1 {
+		t.Fatalf("expected inject failure to avoid a second LLM request, got %d", got)
+	}
+}
+
+func TestWorkspaceTopicInterruptRESTAndQueueDrain(t *testing.T) {
+	server, _, predictable := newTestServer(t)
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws/topic/interrupt-rest?client_id=cli-a"
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("failed to dial websocket: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "test complete")
+	waitForConnectedMessage(t, ctx, conn)
+
+	for _, prompt := range []workspacePromptMessage{
+		{Type: "prompt", PromptID: "p-1", Data: `ws bash "printf slow" toolpause0.2 aftertext "Primary turn complete."`},
+		{Type: "prompt", PromptID: "p-2", Data: "echo: second"},
+	} {
+		if err := wsjson.Write(ctx, conn, prompt); err != nil {
+			t.Fatalf("failed to send prompt %s: %v", prompt.PromptID, err)
+		}
+	}
+
+	for {
+		msg := readWorkspaceWSMessage(t, ctx, conn)
+		if msg.Type == "tool_call" {
+			break
+		}
+	}
+
+	interruptReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/ws/topics/interrupt-rest/interrupt", bytes.NewBufferString(`{"reason":"Wrong approach."}`))
+	if err != nil {
+		t.Fatalf("failed to build interrupt request: %v", err)
+	}
+	interruptReq.Header.Set("Content-Type", "application/json")
+	interruptReq.Header.Set("X-Workspace-Client-ID", "cli-a")
+	interruptResp, err := http.DefaultClient.Do(interruptReq)
+	if err != nil {
+		t.Fatalf("failed to post interrupt request: %v", err)
+	}
+	defer interruptResp.Body.Close()
+	if interruptResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(interruptResp.Body)
+		t.Fatalf("expected 200 from interrupt, got %d: %s", interruptResp.StatusCode, string(body))
+	}
+
+	var doneEvent workspaceWSMessage
+	if err := json.NewDecoder(interruptResp.Body).Decode(&doneEvent); err != nil {
+		t.Fatalf("failed to decode interrupt response: %v", err)
+	}
+	if doneEvent.PromptID != "p-1" || doneEvent.Status != "interrupted" || doneEvent.Reason != "Wrong approach." {
+		t.Fatalf("unexpected interrupt response %#v", doneEvent)
+	}
+
+	var (
+		cancelledSeen   bool
+		interruptedSeen bool
+		secondStarted   bool
+		secondDone      bool
+	)
+
+	for !secondDone {
+		msg := readWorkspaceWSMessage(t, ctx, conn)
+		switch msg.Type {
+		case "prompt_status":
+			if msg.PromptID == "p-1" && msg.Status == string(PromptStatusCancelled) {
+				cancelledSeen = true
+			}
+			if msg.PromptID == "p-2" && msg.Status == string(PromptStatusStarted) {
+				secondStarted = true
+			}
+		case "done":
+			if msg.PromptID == "p-1" && msg.Status == "interrupted" {
+				interruptedSeen = true
+			}
+			if msg.PromptID == "p-2" && msg.Status == "completed" {
+				secondDone = true
+			}
+		}
+	}
+
+	if !cancelledSeen {
+		t.Fatal("expected interrupted prompt to emit cancelled prompt_status")
+	}
+	if !interruptedSeen {
+		t.Fatal("expected interrupted done event on websocket")
+	}
+	if !secondStarted {
+		t.Fatal("expected next queued prompt to start after interrupt")
+	}
+
+	waitFor(t, 2*time.Second, func() bool {
+		return len(predictable.GetRecentRequests()) >= 2
+	})
+	requests := predictable.GetRecentRequests()
+	if len(requests) < 2 {
+		t.Fatalf("expected at least two requests, got %d", len(requests))
+	}
+	if got := lastUserText(requests[len(requests)-1]); got != "echo: second" {
+		t.Fatalf("expected queued prompt to run after interrupt, got %q", got)
 	}
 }
 
@@ -867,6 +1287,79 @@ func TestWorkspaceTopicAPIChatUsesTopicQueue(t *testing.T) {
 	}
 }
 
+func TestWorkspaceTopicToolOutputStaysOnToolUpdate(t *testing.T) {
+	server, _, _ := newTestServer(t)
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws/topic/tool-output?client_id=cli-a"
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("failed to dial websocket: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "test complete")
+	waitForConnectedMessage(t, ctx, conn)
+
+	if err := wsjson.Write(ctx, conn, workspacePromptMessage{
+		Type:     "prompt",
+		PromptID: "p-tool-1",
+		Data:     `ws bash "printf validator-output" toolpause0.1 aftertext "Validator finished."`,
+	}); err != nil {
+		t.Fatalf("failed to send prompt: %v", err)
+	}
+
+	var (
+		toolCallSeen     bool
+		toolUpdateSeen   bool
+		afterTextSeen    bool
+		doneSeen         bool
+		toolOutputLeaked bool
+	)
+
+	for !(toolCallSeen && toolUpdateSeen && afterTextSeen && doneSeen) {
+		msg := readWorkspaceWSMessage(t, ctx, conn)
+		switch msg.Type {
+		case "tool_call":
+			if msg.Title == "bash" {
+				toolCallSeen = true
+				if msg.PromptID != "p-tool-1" {
+					t.Fatalf("expected tool_call promptId p-tool-1, got %#v", msg)
+				}
+			}
+		case "tool_update":
+			if msg.Title == "bash" {
+				if msg.PromptID != "p-tool-1" {
+					t.Fatalf("expected tool_update promptId p-tool-1, got %#v", msg)
+				}
+				if msg.Data != "validator-output" {
+					t.Fatalf("expected tool_update data validator-output, got %#v", msg)
+				}
+				toolUpdateSeen = true
+			}
+		case "text":
+			if msg.Data == "validator-output" {
+				toolOutputLeaked = true
+			}
+			if msg.Data == "Validator finished." {
+				afterTextSeen = true
+			}
+		case "done":
+			if msg.PromptID == "p-tool-1" {
+				doneSeen = true
+			}
+		}
+	}
+
+	if toolOutputLeaked {
+		t.Fatal("expected tool output to stay on tool_update.data, not leak as assistant text")
+	}
+}
+
 func TestWorkspaceTopicWSReplaysUserMessagesOnConnect(t *testing.T) {
 	server, _, _ := newTestServer(t)
 	mux := http.NewServeMux()
@@ -1077,7 +1570,7 @@ func TestRenameTopicConversationKeepsWorkspaceTopicRouting(t *testing.T) {
 }
 
 func TestEmitWorkspaceWSMessagesTranslatesToolLifecycle(t *testing.T) {
-	toolTitles := make(map[string]string)
+	translator := newWorkspaceTranslatorState()
 
 	assistantRaw, err := json.Marshal(llm.Message{
 		Role: llm.MessageRoleAssistant,
@@ -1090,7 +1583,7 @@ func TestEmitWorkspaceWSMessagesTranslatesToolLifecycle(t *testing.T) {
 	}
 	assistantRawStr := string(assistantRaw)
 
-	messages, turnComplete := translateWorkspaceWSMessagesForAPIMessage(toolTitles, APIMessage{
+	messages, turnComplete := translateWorkspaceWSMessagesForAPIMessage(translator, APIMessage{
 		Type:    string(dbpkg.MessageTypeAgent),
 		LlmData: &assistantRawStr,
 	})
@@ -1123,7 +1616,7 @@ func TestEmitWorkspaceWSMessagesTranslatesToolLifecycle(t *testing.T) {
 	}
 	toolRawStr := string(toolRaw)
 
-	messages, turnComplete = translateWorkspaceWSMessagesForAPIMessage(toolTitles, APIMessage{
+	messages, turnComplete = translateWorkspaceWSMessagesForAPIMessage(translator, APIMessage{
 		Type:    string(dbpkg.MessageTypeUser),
 		LlmData: &toolRawStr,
 	})
@@ -1131,15 +1624,15 @@ func TestEmitWorkspaceWSMessagesTranslatesToolLifecycle(t *testing.T) {
 		t.Fatal("did not expect tool result to end the turn")
 	}
 
-	if len(messages) != 2 {
-		t.Fatalf("expected tool status plus text replay, got %#v", messages)
+	if len(messages) != 1 {
+		t.Fatalf("expected one tool update message, got %#v", messages)
 	}
 	toolUpdate := messages[0]
 	if toolUpdate.Type != "tool_update" || toolUpdate.ToolCallID != "tool-1" || toolUpdate.Title != "bash" || toolUpdate.Status != "completed" {
 		t.Fatalf("unexpected tool_update message: %#v", toolUpdate)
 	}
-	if messages[1].Type != "text" || messages[1].Data != "validator output" {
-		t.Fatalf("unexpected translated tool result text: %#v", messages[1])
+	if toolUpdate.Data != "validator output" {
+		t.Fatalf("expected translated tool result text on tool_update, got %#v", toolUpdate)
 	}
 }
 
@@ -1150,6 +1643,12 @@ func waitForConnectedMessage(t *testing.T, ctx context.Context, conn *websocket.
 		if msg.Type == "connected" {
 			if msg.Topic == "" || msg.SessionID == "" {
 				t.Fatalf("expected connected message with topic and session id, got %#v", msg)
+			}
+			if msg.ProtocolVersion != workspaceProtocolVersion {
+				t.Fatalf("expected connected protocolVersion %q, got %#v", workspaceProtocolVersion, msg)
+			}
+			if !msg.Replay {
+				t.Fatalf("expected connected replay=true, got %#v", msg)
 			}
 			return
 		}
@@ -1235,7 +1734,7 @@ func collectSSEStreamResponses(ctx context.Context, body io.Reader, out chan<- S
 }
 
 func waitForSSEText(ctx context.Context, events <-chan StreamResponse, text string) bool {
-	toolTitles := make(map[string]string)
+	translator := newWorkspaceTranslatorState()
 
 	for {
 		select {
@@ -1243,7 +1742,7 @@ func waitForSSEText(ctx context.Context, events <-chan StreamResponse, text stri
 			return false
 		case event := <-events:
 			for _, msg := range event.Messages {
-				translated, _ := translateWorkspaceWSMessagesForAPIMessage(toolTitles, msg)
+				translated, _ := translateWorkspaceWSMessagesForAPIMessage(translator, msg)
 				for _, translatedMsg := range translated {
 					if translatedMsg.Type == "text" && translatedMsg.Data == text {
 						return true

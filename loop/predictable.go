@@ -59,15 +59,28 @@ func (s wsDemoScript) usesTool() bool {
 
 const wsDemoLanguageGuide = `WS language quick guide
 
-Use: ws [tags...]
+Show this guide:
+- ws
+- ws help
+- ws usage
+- ws tutorial
+
+Syntax:
+- ws text <message>
+- ws echo <message>
+- ws bash <shell-command>
+- ws validator <paths-or-validator-args>
+- ws publisher <publisher-args>
+- ws jira <search-query>
+- ws tool <tool-name> action <action-name> [input <json>]
 
 Primary actions:
-- text "..." or echo "..."
-- bash "..."
-- validator "path-or-args"
-- publisher "path-or-args"
-- jira "search terms"
-- tool <tool-name> action <action-name> input '{"json":"value"}'
+- text <message> or echo <message>
+- bash <shell-command>
+- validator <paths-or-validator-args>
+- publisher <publisher-args>
+- jira <search-query>
+- tool <tool-name> action <action-name> input <json>
 
 Timing tags:
 - pause2 or pause 2
@@ -125,6 +138,13 @@ Rules:
 - use exactly one primary action
 - wrap multi-word values in quotes
 - input must be valid JSON`
+
+func wsDemoUsageText(err error) string {
+	if err == nil {
+		return wsDemoLanguageGuide
+	}
+	return fmt.Sprintf("WS usage error: %s\n\n%s", err.Error(), wsDemoLanguageGuide)
+}
 
 // NewPredictableService creates a new predictable LLM service
 func NewPredictableService() *PredictableService {
@@ -315,13 +335,13 @@ func (s *PredictableService) Do(ctx context.Context, req *llm.Request) (*llm.Res
 		}
 
 		if isWSDemoHelp(inputText) {
-			return s.makeResponse(wsDemoLanguageGuide, inputTokens), nil
+			return s.makeResponse(wsDemoUsageText(nil), inputTokens), nil
 		}
 
 		if strings.HasPrefix(inputText, "ws ") || strings.HasPrefix(inputText, "ws: ") || inputText == "ws" || inputText == "ws:" {
 			script, err := parseWSDemoScript(inputText)
 			if err != nil {
-				return s.makeResponse(err.Error(), inputTokens), nil
+				return s.makeResponse(wsDemoUsageText(err), inputTokens), nil
 			}
 			return s.makeWSDemoResponse(ctx, req, script, inputTokens)
 		}
@@ -368,7 +388,7 @@ func predictableInputContext(req *llm.Request) (currentText, latestUserText stri
 
 func isWSDemoHelp(inputText string) bool {
 	switch strings.TrimSpace(inputText) {
-	case "ws help", "ws: help", "ws tutorial", "ws: tutorial", "ws examples", "ws: examples":
+	case "ws", "ws:", "ws help", "ws: help", "ws usage", "ws: usage", "ws tutorial", "ws: tutorial", "ws examples", "ws: examples":
 		return true
 	default:
 		return false
@@ -380,7 +400,7 @@ func parseWSDemoScript(inputText string) (wsDemoScript, error) {
 	args := ""
 	switch {
 	case trimmed == "ws" || trimmed == "ws:":
-		return wsDemoScript{}, fmt.Errorf("ws usage: ws [pauseN|pause N] [toolpauseN|toolpause N] [afterpauseN|afterpause N] text|bash|validator|publisher|jira|tool ...")
+		return wsDemoScript{}, fmt.Errorf("missing ws action")
 	case strings.HasPrefix(trimmed, "ws:"):
 		args = strings.TrimSpace(strings.TrimPrefix(trimmed, "ws:"))
 	case strings.HasPrefix(trimmed, "ws "):
@@ -390,7 +410,7 @@ func parseWSDemoScript(inputText string) (wsDemoScript, error) {
 	}
 
 	if args == "" {
-		return wsDemoScript{}, fmt.Errorf("ws usage: ws [pauseN|pause N] [toolpauseN|toolpause N] [afterpauseN|afterpause N] text|bash|validator|publisher|jira|tool ...")
+		return wsDemoScript{}, fmt.Errorf("missing ws action")
 	}
 
 	fields, err := splitWSDemoArgs(args)

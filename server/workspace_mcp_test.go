@@ -184,6 +184,78 @@ func TestWorkspaceToolMCPStdioBunFixtureFromWorkspace(t *testing.T) {
 	}
 }
 
+func TestWorkspaceToolManagerProxyInvokesManagerEndpoint(t *testing.T) {
+	server, _, _ := newTestServer(t)
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	managerCalls := 0
+	managerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		managerCalls++
+		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
+			t.Fatalf("authorization = %q", got)
+		}
+		if want := "/internal/namespaces/acme/workspaces/bp-ig-fix/tools/hl7-jira/invoke"; r.URL.Path != want {
+			t.Fatalf("path = %q, want %q", r.URL.Path, want)
+		}
+		var req managerProxyInvokeRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode invoke request: %v", err)
+		}
+		if req.Action != "jira.search" {
+			t.Fatalf("action = %q", req.Action)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(managerProxyInvokeResponse{Content: "FHIR-53953\nFHIR-53960"})
+	}))
+	defer managerServer.Close()
+
+	t.Setenv("WORKSPACE_MANAGER_INTERNAL_URL", managerServer.URL)
+	t.Setenv("WORKSPACE_MANAGER_TOKEN", "test-token")
+	t.Setenv("WORKSPACE_NAME", "bp-ig-fix")
+	t.Setenv("WORKSPACE_NAMESPACE", "acme")
+
+	createWorkspaceTool(t, httpServer.URL, `{
+		"name":"hl7-jira",
+		"description":"Search realistic HL7 Jira fixture data",
+		"protocol":"mcp",
+		"transport":{
+			"type":"manager_proxy"
+		},
+		"tools":[
+			{
+				"name":"jira.search",
+				"description":"Search realistic HL7 Jira issues related to validation and FHIRPath behavior",
+				"inputSchema":{
+					"type":"object",
+					"properties":{"query":{"type":"string"}},
+					"required":["query"],
+					"additionalProperties":false
+				}
+			}
+		]
+	}`)
+	createWorkspaceGrant(t, httpServer.URL, "hl7-jira", `{
+		"subject":"agent:*",
+		"tools":["jira.search"],
+		"access":"allowed"
+	}`)
+
+	tool := workspaceRuntimeTool(t, server, "alpha", "workspace_hl7-jira")
+	result := tool.Run(context.Background(), []byte(`{"action":"jira.search","input":{"query":"validation error handling"}}`))
+	if result.Error != nil {
+		t.Fatalf("expected manager proxy mcp tool to succeed, got %v", result.Error)
+	}
+	if managerCalls != 1 {
+		t.Fatalf("expected one manager invoke call, got %d", managerCalls)
+	}
+	if len(result.LLMContent) == 0 || !strings.Contains(result.LLMContent[0].Text, "FHIR-53953") {
+		t.Fatalf("expected manager proxy tool output, got %#v", result.LLMContent)
+	}
+}
+
 func TestWorkspaceToolMCPStreamableHTTPExecutesTextTool(t *testing.T) {
 	server, _, _ := newTestServer(t)
 	mux := http.NewServeMux()

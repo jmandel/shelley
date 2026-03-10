@@ -13,6 +13,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 
+	"shelley.exe.dev/db"
 	"shelley.exe.dev/llm"
 )
 
@@ -349,11 +350,115 @@ func TestWorkspaceToolsStoreActionMetadataAndRuntimeSchema(t *testing.T) {
 	}
 
 	schemaJSON := string(runtimeTool.InputSchema)
+	if strings.Contains(schemaJSON, `"oneOf"`) {
+		t.Fatalf("expected runtime tool schema to avoid top-level oneOf for Anthropic compatibility, got %s", schemaJSON)
+	}
 	if !strings.Contains(schemaJSON, `"customerId"`) {
 		t.Fatalf("expected runtime tool schema to include granted action input schema, got %s", schemaJSON)
 	}
 	if strings.Contains(schemaJSON, `"query"`) {
 		t.Fatalf("expected runtime tool schema to omit non-granted action schema, got %s", schemaJSON)
+	}
+}
+
+func TestWorkspaceToolsMultiActionRuntimeSchemaAvoidsTopLevelOneOf(t *testing.T) {
+	server, _, _ := newTestServer(t)
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	createWorkspaceTool(t, httpServer.URL, `{
+		"name":"crm",
+		"description":"CRM access",
+		"actions":[
+			{
+				"name":"read",
+				"description":"Read customer records",
+				"inputSchema":{
+					"type":"object",
+					"properties":{"customerId":{"type":"string"}},
+					"required":["customerId"],
+					"additionalProperties":false
+				}
+			},
+			{
+				"name":"search",
+				"description":"Search customers",
+				"inputSchema":{
+					"type":"object",
+					"properties":{"query":{"type":"string"}},
+					"required":["query"],
+					"additionalProperties":false
+				}
+			}
+		]
+	}`)
+	createWorkspaceGrant(t, httpServer.URL, "crm", `{
+		"subject":"agent:*",
+		"actions":["read","search"],
+		"access":"allowed"
+	}`)
+
+	runtimeTool := workspaceRuntimeTool(t, server, "alpha", "workspace_crm")
+	schemaJSON := string(runtimeTool.InputSchema)
+	if strings.Contains(schemaJSON, `"oneOf"`) {
+		t.Fatalf("expected runtime tool schema to avoid top-level oneOf for Anthropic compatibility, got %s", schemaJSON)
+	}
+	if !strings.Contains(schemaJSON, `"enum":["read","search"]`) {
+		t.Fatalf("expected action enum in runtime tool schema, got %s", schemaJSON)
+	}
+	if !strings.Contains(schemaJSON, `"description":"Action-specific input payload.`) {
+		t.Fatalf("expected descriptive multi-action input guidance in runtime tool schema, got %s", schemaJSON)
+	}
+}
+
+func TestWorkspaceToolGrantRefreshesTopicSystemPromptDisplayData(t *testing.T) {
+	server, database, _ := newTestServer(t)
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	sessionID := createWorkspaceTopic(t, httpServer.URL, "jira-ui")
+
+	if tools := systemPromptToolNames(t, database, sessionID); containsString(tools, "workspace_hl7-jira") {
+		t.Fatalf("expected no workspace_hl7-jira before registration, got %#v", tools)
+	}
+
+	createWorkspaceTool(t, httpServer.URL, `{
+		"name":"hl7-jira",
+		"description":"Search realistic HL7 Jira fixture data",
+		"protocol":"mcp",
+		"actions":[
+			{
+				"name":"jira.search",
+				"description":"Search Jira",
+				"inputSchema":{
+					"type":"object",
+					"properties":{"query":{"type":"string"}},
+					"required":["query"],
+					"additionalProperties":false
+				}
+			}
+		],
+		"config":{
+			"type":"stdio",
+			"command":"bun",
+			"args":["./.demo/hl7-jira-mcp.js"],
+			"cwd":"."
+		}
+	}`)
+
+	createWorkspaceGrant(t, httpServer.URL, "hl7-jira", `{
+		"subject":"agent:*",
+		"actions":["jira.search"],
+		"access":"allowed"
+	}`)
+
+	tools := systemPromptToolNames(t, database, sessionID)
+	if !containsString(tools, "workspace_hl7-jira") {
+		t.Fatalf("expected system prompt display data to include workspace_hl7-jira after grant, got %#v", tools)
 	}
 }
 
@@ -723,6 +828,39 @@ func createWorkspaceGrant(t *testing.T, baseURL, toolName, rawJSON string) {
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("expected 201 from workspace grant create, got %d", resp.StatusCode)
 	}
+}
+
+func systemPromptToolNames(t *testing.T, database *db.DB, conversationID string) []string {
+	t.Helper()
+
+	systemMessages, err := database.ListMessagesByType(context.Background(), conversationID, db.MessageTypeSystem)
+	if err != nil {
+		t.Fatalf("failed to list system messages: %v", err)
+	}
+	if len(systemMessages) == 0 {
+		t.Fatalf("expected system prompt message for %s", conversationID)
+	}
+
+	type systemTool struct {
+		Name string `json:"name"`
+	}
+	type systemDisplay struct {
+		Tools []systemTool `json:"tools"`
+	}
+
+	var display systemDisplay
+	if systemMessages[0].DisplayData == nil {
+		t.Fatalf("expected system prompt display data for %s", conversationID)
+	}
+	if err := json.Unmarshal([]byte(*systemMessages[0].DisplayData), &display); err != nil {
+		t.Fatalf("failed to decode system prompt display data: %v", err)
+	}
+
+	names := make([]string, 0, len(display.Tools))
+	for _, tool := range display.Tools {
+		names = append(names, tool.Name)
+	}
+	return names
 }
 
 func sendTopicAPIChat(t *testing.T, baseURL, sessionID, message string) {

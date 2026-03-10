@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -22,19 +23,20 @@ var errConversationModelMismatch = errors.New("conversation model mismatch")
 
 // ConversationManager manages a single active conversation
 type ConversationManager struct {
-	conversationID string
-	db             *db.DB
-	loop           *loop.Loop
-	loopCancel     context.CancelFunc
-	loopCtx        context.Context
-	mu             sync.Mutex
-	lastActivity   time.Time
-	modelID        string
-	recordMessage  loop.MessageRecordFunc
-	logger         *slog.Logger
-	toolSetConfig  claudetool.ToolSetConfig
-	toolSet        *claudetool.ToolSet // created per-conversation when loop starts
-	extraTools     []*llm.Tool
+	conversationID            string
+	db                        *db.DB
+	loop                      *loop.Loop
+	loopCancel                context.CancelFunc
+	loopCtx                   context.Context
+	mu                        sync.Mutex
+	lastActivity              time.Time
+	modelID                   string
+	recordMessage             loop.MessageRecordFunc
+	recordMessageWithUserData func(ctx context.Context, message llm.Message, usage llm.Usage, userData ...interface{}) error
+	logger                    *slog.Logger
+	toolSetConfig             claudetool.ToolSetConfig
+	toolSet                   *claudetool.ToolSet // created per-conversation when loop starts
+	extraTools                []*llm.Tool
 
 	subpub *subpub.SubPub[StreamResponse]
 
@@ -53,7 +55,7 @@ type ConversationManager struct {
 }
 
 // NewConversationManager constructs a manager with dependencies but defers hydration until needed.
-func NewConversationManager(conversationID string, database *db.DB, baseLogger *slog.Logger, toolSetConfig claudetool.ToolSetConfig, recordMessage loop.MessageRecordFunc, onStateChange func(ConversationState)) *ConversationManager {
+func NewConversationManager(conversationID string, database *db.DB, baseLogger *slog.Logger, toolSetConfig claudetool.ToolSetConfig, recordMessage loop.MessageRecordFunc, recordMessageWithUserData func(ctx context.Context, message llm.Message, usage llm.Usage, userData ...interface{}) error, onStateChange func(ConversationState)) *ConversationManager {
 	logger := baseLogger
 	if logger == nil {
 		logger = slog.Default()
@@ -61,14 +63,15 @@ func NewConversationManager(conversationID string, database *db.DB, baseLogger *
 	logger = logger.With("conversationID", conversationID)
 
 	return &ConversationManager{
-		conversationID: conversationID,
-		db:             database,
-		lastActivity:   time.Now(),
-		recordMessage:  recordMessage,
-		logger:         logger,
-		toolSetConfig:  toolSetConfig,
-		subpub:         subpub.New[StreamResponse](),
-		onStateChange:  onStateChange,
+		conversationID:            conversationID,
+		db:                        database,
+		lastActivity:              time.Now(),
+		recordMessage:             recordMessage,
+		recordMessageWithUserData: recordMessageWithUserData,
+		logger:                    logger,
+		toolSetConfig:             toolSetConfig,
+		subpub:                    subpub.New[StreamResponse](),
+		onStateChange:             onStateChange,
 	}
 }
 
@@ -191,6 +194,14 @@ func (cm *ConversationManager) Hydrate(ctx context.Context) error {
 // The message is recorded to the database immediately so it appears in the UI,
 // even if the loop is busy processing a previous request.
 func (cm *ConversationManager) AcceptUserMessage(ctx context.Context, service llm.Service, modelID string, message llm.Message) (bool, error) {
+	return cm.acceptUserMessage(ctx, service, modelID, message, nil, nil)
+}
+
+func (cm *ConversationManager) AcceptUserMessageWithMetadata(ctx context.Context, service llm.Service, modelID string, message llm.Message, userData any, onDelivered func()) (bool, error) {
+	return cm.acceptUserMessage(ctx, service, modelID, message, userData, onDelivered)
+}
+
+func (cm *ConversationManager) acceptUserMessage(ctx context.Context, service llm.Service, modelID string, message llm.Message, userData any, onDelivered func()) (bool, error) {
 	if service == nil {
 		return false, fmt.Errorf("llm service is required")
 	}
@@ -209,6 +220,7 @@ func (cm *ConversationManager) AcceptUserMessage(ctx context.Context, service ll
 	loopInstance := cm.loop
 	cm.lastActivity = time.Now()
 	recordMessage := cm.recordMessage
+	recordMessageWithUserData := cm.recordMessageWithUserData
 	cm.mu.Unlock()
 
 	if loopInstance == nil {
@@ -218,13 +230,23 @@ func (cm *ConversationManager) AcceptUserMessage(ctx context.Context, service ll
 	// Record the user message to the database immediately so it appears in the UI,
 	// even if the loop is busy processing a previous request
 	if recordMessage != nil {
-		if err := recordMessage(ctx, message, llm.Usage{}); err != nil {
+		if userData != nil {
+			if recordMessageWithUserData != nil {
+				if err := recordMessageWithUserData(ctx, message, llm.Usage{}, userData); err != nil {
+					cm.logger.Error("failed to record user message immediately", "error", err)
+					return false, fmt.Errorf("record user message immediately: %w", err)
+				}
+			} else if err := recordMessage(ctx, message, llm.Usage{}); err != nil {
+				cm.logger.Error("failed to record user message immediately", "error", err)
+				return false, fmt.Errorf("record user message immediately: %w", err)
+			}
+		} else if err := recordMessage(ctx, message, llm.Usage{}); err != nil {
 			cm.logger.Error("failed to record user message immediately", "error", err)
-			// Continue anyway - the loop will also try to record it
+			return false, fmt.Errorf("record user message immediately: %w", err)
 		}
 	}
 
-	loopInstance.QueueUserMessage(message)
+	loopInstance.QueueUserMessageWithCallback(message, onDelivered)
 
 	// Mark agent as working - we just queued work for the loop
 	cm.SetAgentWorking(true)
@@ -297,6 +319,35 @@ func (cm *ConversationManager) SetExtraTools(extraTools []*llm.Tool) {
 	if loopInstance != nil {
 		loopInstance.SetTools(combineTools(localTools, extraCopy))
 	}
+}
+
+func (cm *ConversationManager) RefreshSystemPromptDisplayData(ctx context.Context) error {
+	systemMessages, err := cm.db.ListMessagesByType(ctx, cm.conversationID, db.MessageTypeSystem)
+	if err != nil {
+		return fmt.Errorf("list system messages: %w", err)
+	}
+	if len(systemMessages) == 0 {
+		return nil
+	}
+
+	displayData := systemPromptDisplayData(cm.toolSetConfig, cm.extraToolsSnapshot())
+	displayJSON, err := json.Marshal(displayData)
+	if err != nil {
+		return fmt.Errorf("marshal system prompt display data: %w", err)
+	}
+
+	for _, msg := range systemMessages {
+		if err := cm.db.Pool().Exec(ctx, "UPDATE messages SET display_data = ? WHERE message_id = ?", string(displayJSON), msg.MessageID); err != nil {
+			return fmt.Errorf("update system prompt display data: %w", err)
+		}
+	}
+	return nil
+}
+
+func (cm *ConversationManager) HasConversationEvents() bool {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	return cm.hasConversationEvents
 }
 
 func (cm *ConversationManager) createSystemPrompt(ctx context.Context) (*generated.Message, error) {
@@ -590,6 +641,14 @@ func (cm *ConversationManager) stopLoop() {
 
 // CancelConversation cancels the current conversation loop and records a cancelled tool result if a tool was in progress
 func (cm *ConversationManager) CancelConversation(ctx context.Context) error {
+	return cm.cancelConversation(ctx, nil)
+}
+
+func (cm *ConversationManager) CancelConversationWithMetadata(ctx context.Context, userData any) error {
+	return cm.cancelConversation(ctx, userData)
+}
+
+func (cm *ConversationManager) cancelConversation(ctx context.Context, userData any) error {
 	cm.mu.Lock()
 	loopInstance := cm.loop
 	loopCtx := cm.loopCtx
@@ -706,7 +765,18 @@ func (cm *ConversationManager) CancelConversation(ctx context.Context) error {
 		EndOfTurn: true,
 	}
 
-	if err := cm.recordMessage(ctx, endTurnMessage, llm.Usage{}); err != nil {
+	recordWithUserData := cm.recordMessageWithUserData
+	var err error
+	if userData != nil {
+		if recordWithUserData != nil {
+			err = recordWithUserData(ctx, endTurnMessage, llm.Usage{}, userData)
+		} else {
+			err = cm.recordMessage(ctx, endTurnMessage, llm.Usage{})
+		}
+	} else {
+		err = cm.recordMessage(ctx, endTurnMessage, llm.Usage{})
+	}
+	if err != nil {
 		cm.logger.Error("Failed to record end turn message", "error", err)
 		return fmt.Errorf("failed to record end turn message: %w", err)
 	}

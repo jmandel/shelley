@@ -167,6 +167,11 @@ func (s *Server) handleWorkspaceToolsCreate(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
+	if err := s.refreshWorkspaceTopicsToolViews(r.Context()); err != nil {
+		s.logger.Error("Failed to refresh workspace topic tool views", "name", req.Name, "error", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -213,6 +218,11 @@ func (s *Server) handleWorkspaceTool(w http.ResponseWriter, r *http.Request) {
 			return q.DeleteWorkspaceToolByName(r.Context(), toolName)
 		}); err != nil {
 			s.logger.Error("Failed to delete workspace tool", "tool", toolName, "error", err)
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+		if err := s.refreshWorkspaceTopicsToolViews(r.Context()); err != nil {
+			s.logger.Error("Failed to refresh workspace topic tool views after delete", "tool", toolName, "error", err)
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
@@ -337,6 +347,11 @@ func (s *Server) handleWorkspaceToolGrants(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
+	if err := s.refreshWorkspaceTopicsToolViews(r.Context()); err != nil {
+		s.logger.Error("Failed to refresh workspace topic tool views after grant create", "tool", toolName, "error", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -353,6 +368,11 @@ func (s *Server) handleWorkspaceToolGrant(w http.ResponseWriter, r *http.Request
 		return q.DeleteWorkspaceGrant(r.Context(), r.PathValue("grant"))
 	}); err != nil {
 		s.logger.Error("Failed to delete workspace grant", "grant", r.PathValue("grant"), "error", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+	if err := s.refreshWorkspaceTopicsToolViews(r.Context()); err != nil {
+		s.logger.Error("Failed to refresh workspace topic tool views after grant delete", "grant", r.PathValue("grant"), "error", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
@@ -545,6 +565,33 @@ func workspaceTransportFromConfig(raw string) json.RawMessage {
 		return json.RawMessage(trimmed)
 	}
 	return normalized
+}
+
+func (s *Server) refreshWorkspaceTopicsToolViews(ctx context.Context) error {
+	var topicRecords []generated.Topic
+	if err := s.db.Queries(ctx, func(q *generated.Queries) error {
+		var err error
+		topicRecords, err = q.ListTopics(ctx)
+		return err
+	}); err != nil {
+		return err
+	}
+
+	for _, topicRecord := range topicRecords {
+		topic, _, err := s.topicManager.GetOrCreateTopic(ctx, topicRecord.TopicName)
+		if err != nil {
+			return err
+		}
+		if err := topic.refreshWorkspaceTools(ctx); err != nil {
+			return err
+		}
+		if !topic.Manager.HasConversationEvents() {
+			if err := topic.Manager.RefreshSystemPromptDisplayData(ctx); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (s *Server) lookupWorkspaceToolByName(ctx context.Context, name string) (*generated.WorkspaceTool, error) {

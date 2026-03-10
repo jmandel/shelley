@@ -376,6 +376,8 @@ func (s *Server) registerCanonicalWorkspaceRoutes(mux *http.ServeMux) {
 	mux.Handle("DELETE /ws/topics/{name}/queue/{prompt}", http.HandlerFunc(s.handleWorkspaceTopicQueueEntry))
 	mux.Handle("POST /ws/topics/{name}/queue/{prompt}/move", http.HandlerFunc(s.handleWorkspaceTopicQueueMove))
 	mux.Handle("POST /ws/topics/{name}/queue:clear-mine", http.HandlerFunc(s.handleWorkspaceTopicQueueClearMine))
+	mux.Handle("POST /ws/topics/{name}/inject", http.HandlerFunc(s.handleWorkspaceTopicInject))
+	mux.Handle("POST /ws/topics/{name}/interrupt", http.HandlerFunc(s.handleWorkspaceTopicInterrupt))
 	mux.Handle("GET /ws/files", http.HandlerFunc(s.handleWorkspaceFile))
 	mux.Handle("GET /ws/files/{$}", http.HandlerFunc(s.handleWorkspaceFile))
 	mux.Handle("GET /ws/files/{path...}", http.HandlerFunc(s.handleWorkspaceFile))
@@ -402,6 +404,8 @@ func (s *Server) registerWorkspaceCompatibilityRoutes(mux *http.ServeMux) {
 	mux.Handle("DELETE /topics/{name}/queue/{prompt}", http.HandlerFunc(s.handleWorkspaceTopicQueueEntry))
 	mux.Handle("POST /topics/{name}/queue/{prompt}/move", http.HandlerFunc(s.handleWorkspaceTopicQueueMove))
 	mux.Handle("POST /topics/{name}/queue:clear-mine", http.HandlerFunc(s.handleWorkspaceTopicQueueClearMine))
+	mux.Handle("POST /topics/{name}/inject", http.HandlerFunc(s.handleWorkspaceTopicInject))
+	mux.Handle("POST /topics/{name}/interrupt", http.HandlerFunc(s.handleWorkspaceTopicInterrupt))
 
 	// ACP aliases remain for the checked-out Bun CLI and wmlet-style clients.
 	mux.Handle("GET /acp", http.HandlerFunc(s.handleWorkspaceTopicQueryWS))
@@ -754,6 +758,10 @@ func (s *Server) handleCreateDirectory(w http.ResponseWriter, r *http.Request) {
 
 // getOrCreateConversationManager gets an existing conversation manager or creates a new one.
 func (s *Server) getOrCreateConversationManager(ctx context.Context, conversationID, userEmail string) (*ConversationManager, error) {
+	return s.getOrCreateConversationManagerConfigured(ctx, conversationID, userEmail, nil)
+}
+
+func (s *Server) getOrCreateConversationManagerConfigured(ctx context.Context, conversationID, userEmail string, configure func(*ConversationManager) error) (*ConversationManager, error) {
 	manager, err, _ := s.conversationGroup.Do(conversationID, func() (*ConversationManager, error) {
 		s.mu.Lock()
 		defer s.mu.Unlock()
@@ -765,13 +773,21 @@ func (s *Server) getOrCreateConversationManager(ctx context.Context, conversatio
 		recordMessage := func(ctx context.Context, message llm.Message, usage llm.Usage) error {
 			return s.recordMessage(ctx, conversationID, message, usage)
 		}
+		recordMessageWithUserData := func(ctx context.Context, message llm.Message, usage llm.Usage, userData ...interface{}) error {
+			return s.recordMessage(ctx, conversationID, message, usage, userData...)
+		}
 
 		onStateChange := func(state ConversationState) {
 			s.publishConversationState(state)
 		}
 
-		manager := NewConversationManager(conversationID, s.db, s.logger, s.toolSetConfig, recordMessage, onStateChange)
+		manager := NewConversationManager(conversationID, s.db, s.logger, s.toolSetConfig, recordMessage, recordMessageWithUserData, onStateChange)
 		manager.userEmail = userEmail
+		if configure != nil {
+			if err := configure(manager); err != nil {
+				return nil, err
+			}
+		}
 		if err := manager.Hydrate(ctx); err != nil {
 			return nil, err
 		}
@@ -800,6 +816,9 @@ func (s *Server) getOrCreateSubagentConversationManager(ctx context.Context, con
 		recordMessage := func(ctx context.Context, message llm.Message, usage llm.Usage) error {
 			return s.recordMessage(ctx, conversationID, message, usage)
 		}
+		recordMessageWithUserData := func(ctx context.Context, message llm.Message, usage llm.Usage, userData ...interface{}) error {
+			return s.recordMessage(ctx, conversationID, message, usage, userData...)
+		}
 
 		onStateChange := func(state ConversationState) {
 			s.publishConversationState(state)
@@ -809,7 +828,7 @@ func (s *Server) getOrCreateSubagentConversationManager(ctx context.Context, con
 		subagentConfig := s.toolSetConfig
 		subagentConfig.SubagentDepth = s.toolSetConfig.SubagentDepth + 1
 
-		manager := NewConversationManager(conversationID, s.db, s.logger, subagentConfig, recordMessage, onStateChange)
+		manager := NewConversationManager(conversationID, s.db, s.logger, subagentConfig, recordMessage, recordMessageWithUserData, onStateChange)
 		if err := manager.Hydrate(ctx); err != nil {
 			return nil, err
 		}

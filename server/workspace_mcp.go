@@ -1,9 +1,11 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -50,6 +52,9 @@ func (s *Server) executeMCPWorkspaceTool(ctx context.Context, toolRecord generat
 	cfg, err := decodeWorkspaceMCPConfig(toolRecord)
 	if err != nil {
 		return llm.ErrorToolOut(err)
+	}
+	if cfg.Transport == "manager_proxy" {
+		return s.executeManagerProxyWorkspaceTool(ctx, toolRecord, req)
 	}
 
 	transport, err := s.newWorkspaceMCPTransport(ctx, cfg)
@@ -109,6 +114,8 @@ func decodeWorkspaceMCPConfig(toolRecord generated.WorkspaceTool) (workspaceMCPC
 		if strings.TrimSpace(cfg.Command) == "" {
 			return cfg, fmt.Errorf("workspace tool %s stdio transport requires command", toolRecord.Name)
 		}
+	case "manager_proxy", "manager-proxy":
+		cfg.Transport = "manager_proxy"
 	case "streamable_http", "streamable-http":
 		cfg.Transport = "streamable_http"
 		if strings.TrimSpace(cfg.Endpoint) == "" {
@@ -121,6 +128,64 @@ func decodeWorkspaceMCPConfig(toolRecord generated.WorkspaceTool) (workspaceMCPC
 		return cfg, fmt.Errorf("workspace tool %s has unsupported mcp transport %q", toolRecord.Name, cfg.Transport)
 	}
 	return cfg, nil
+}
+
+type managerProxyInvokeRequest struct {
+	Action string          `json:"action"`
+	Input  json.RawMessage `json:"input,omitempty"`
+}
+
+type managerProxyInvokeResponse struct {
+	Content string `json:"content,omitempty"`
+}
+
+func (s *Server) executeManagerProxyWorkspaceTool(ctx context.Context, toolRecord generated.WorkspaceTool, req workspaceToolInvocation) llm.ToolOut {
+	managerURL := strings.TrimSpace(os.Getenv("WORKSPACE_MANAGER_INTERNAL_URL"))
+	if managerURL == "" {
+		return llm.ErrorfToolOut("workspace tool %s requires WORKSPACE_MANAGER_INTERNAL_URL", toolRecord.Name)
+	}
+	workspaceName := strings.TrimSpace(os.Getenv("WORKSPACE_NAME"))
+	workspaceNamespace := strings.TrimSpace(os.Getenv("WORKSPACE_NAMESPACE"))
+	if workspaceName == "" || workspaceNamespace == "" {
+		return llm.ErrorfToolOut("workspace tool %s requires WORKSPACE_NAME and WORKSPACE_NAMESPACE", toolRecord.Name)
+	}
+	body, err := json.Marshal(managerProxyInvokeRequest{
+		Action: req.Action,
+		Input:  req.Input,
+	})
+	if err != nil {
+		return llm.ErrorToolOut(err)
+	}
+	endpoint := strings.TrimRight(managerURL, "/") + "/internal/namespaces/" + workspaceNamespace + "/workspaces/" + workspaceName + "/tools/" + toolRecord.Name + "/invoke"
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return llm.ErrorToolOut(err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if token := strings.TrimSpace(os.Getenv("WORKSPACE_MANAGER_TOKEN")); token != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		return llm.ErrorfToolOut("invoke managed workspace tool %s/%s: %v", toolRecord.Name, req.Action, err)
+	}
+	defer resp.Body.Close()
+	respBody, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		return llm.ErrorfToolOut("read managed workspace tool %s/%s: %v", toolRecord.Name, req.Action, readErr)
+	}
+	if resp.StatusCode != http.StatusOK {
+		message := strings.TrimSpace(string(respBody))
+		if message == "" {
+			message = fmt.Sprintf("status %d", resp.StatusCode)
+		}
+		return llm.ErrorfToolOut("managed workspace tool %s/%s failed: %s", toolRecord.Name, req.Action, message)
+	}
+	var invokeResp managerProxyInvokeResponse
+	if err := json.Unmarshal(respBody, &invokeResp); err != nil {
+		return llm.ErrorfToolOut("decode managed workspace tool %s/%s response: %v", toolRecord.Name, req.Action, err)
+	}
+	return llm.ToolOut{LLMContent: []llm.Content{llm.StringContent(invokeResp.Content)}}
 }
 
 func (s *Server) newWorkspaceMCPTransport(ctx context.Context, cfg workspaceMCPConfig) (mcp.Transport, error) {

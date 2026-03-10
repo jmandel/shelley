@@ -129,6 +129,25 @@ func buildWorkspaceToolDescription(description *string, actions []workspaceActio
 
 func buildWorkspaceToolSchema(actions []workspaceActionDef) json.RawMessage {
 	actionNames := workspaceActionNames(actions)
+	inputProperty := map[string]any{
+		"type":                 "object",
+		"description":          buildWorkspaceToolInputDescription(actions),
+		"additionalProperties": true,
+	}
+	if len(actions) == 1 {
+		inputSchema, err := workspaceActionSchemaAny(actions[0])
+		if err != nil {
+			panic(err)
+		}
+		if schemaMap, ok := inputSchema.(map[string]any); ok {
+			if description := strings.TrimSpace(buildWorkspaceToolInputDescription(actions)); description != "" {
+				if _, hasDescription := schemaMap["description"]; !hasDescription {
+					schemaMap["description"] = description
+				}
+			}
+			inputProperty = schemaMap
+		}
+	}
 	schemaMap := map[string]any{
 		"type":     "object",
 		"required": []string{"action"},
@@ -138,47 +157,9 @@ func buildWorkspaceToolSchema(actions []workspaceActionDef) json.RawMessage {
 				"enum":        actionNames,
 				"description": "Workspace tool action to perform.",
 			},
-			"input": map[string]any{
-				"type":                 "object",
-				"description":          "Tool-specific input payload.",
-				"additionalProperties": true,
-			},
+			"input": inputProperty,
 		},
 		"additionalProperties": false,
-	}
-
-	var variants []any
-	for _, action := range actions {
-		inputSchema, err := workspaceActionSchemaAny(action)
-		if err != nil {
-			panic(err)
-		}
-		required := []string{"action"}
-		if len(action.InputSchema) > 0 {
-			required = append(required, "input")
-		}
-
-		actionSchema := map[string]any{
-			"type":     "object",
-			"required": required,
-			"properties": map[string]any{
-				"action": map[string]any{
-					"type":        "string",
-					"const":       action.Name,
-					"description": "Workspace tool action to perform.",
-				},
-				"input": inputSchema,
-			},
-			"additionalProperties": false,
-		}
-		if action.Description != "" {
-			actionSchema["description"] = action.Description
-			actionSchema["properties"].(map[string]any)["action"].(map[string]any)["description"] = action.Description
-		}
-		variants = append(variants, actionSchema)
-	}
-	if len(variants) > 0 {
-		schemaMap["oneOf"] = variants
 	}
 
 	schema, err := json.Marshal(schemaMap)
@@ -186,6 +167,73 @@ func buildWorkspaceToolSchema(actions []workspaceActionDef) json.RawMessage {
 		panic(err)
 	}
 	return schema
+}
+
+func buildWorkspaceToolInputDescription(actions []workspaceActionDef) string {
+	if len(actions) == 0 {
+		return "Tool-specific input payload."
+	}
+	if len(actions) == 1 {
+		action := actions[0]
+		summary := describeWorkspaceActionInput(action)
+		if summary == "" {
+			return "Tool-specific input payload."
+		}
+		return fmt.Sprintf("Input for action %s. %s", action.Name, summary)
+	}
+
+	parts := make([]string, 0, len(actions))
+	for _, action := range actions {
+		summary := describeWorkspaceActionInput(action)
+		if summary == "" {
+			parts = append(parts, fmt.Sprintf("%s: object input payload", action.Name))
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s: %s", action.Name, summary))
+	}
+	return "Action-specific input payload. " + strings.Join(parts, " ")
+}
+
+func describeWorkspaceActionInput(action workspaceActionDef) string {
+	if len(action.InputSchema) == 0 {
+		return ""
+	}
+
+	var schema map[string]any
+	if err := json.Unmarshal(action.InputSchema, &schema); err != nil {
+		return ""
+	}
+
+	properties, _ := schema["properties"].(map[string]any)
+	if len(properties) == 0 {
+		return "Accepts an object input."
+	}
+
+	propertyNames := make([]string, 0, len(properties))
+	for name := range properties {
+		propertyNames = append(propertyNames, name)
+	}
+	sort.Strings(propertyNames)
+
+	requiredSet := make(map[string]struct{})
+	if required, ok := schema["required"].([]any); ok {
+		for _, value := range required {
+			if name, ok := value.(string); ok {
+				requiredSet[name] = struct{}{}
+			}
+		}
+	}
+
+	parts := make([]string, 0, len(propertyNames))
+	for _, name := range propertyNames {
+		label := name
+		if _, ok := requiredSet[name]; ok {
+			label += " (required)"
+		}
+		parts = append(parts, label)
+	}
+
+	return "Fields: " + strings.Join(parts, ", ") + "."
 }
 
 func (s *Server) runWorkspaceTool(ctx context.Context, topicName string, toolRecord generated.WorkspaceTool, registeredActions []string, actionPolicies map[string]string, approvalApprovers map[string][]string, input json.RawMessage) llm.ToolOut {
