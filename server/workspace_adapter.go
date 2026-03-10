@@ -764,7 +764,7 @@ func translateWorkspaceWSMessagesForAPIMessage(toolTitles map[string]string, msg
 			messages = append(messages, workspaceWSMessage{Type: "done"})
 			return messages, true
 		}
-	case string(dbpkg.MessageTypeTool):
+	case string(dbpkg.MessageTypeUser), string(dbpkg.MessageTypeTool):
 		for _, content := range llmMsg.Content {
 			if content.Type != llm.ContentTypeToolResult {
 				continue
@@ -836,23 +836,28 @@ func workspaceTopicACPURL(r *http.Request, topicName string) string {
 	return fmt.Sprintf("%s://%s/acp/%s", scheme, r.Host, url.PathEscape(topicName))
 }
 
-func workspaceBaseURLs(r *http.Request) (apiURL, acpURL string) {
+func workspaceCanonicalAPIBaseURL(r *http.Request) string {
 	scheme := "http"
-	wsScheme := "ws"
 	if r.TLS != nil {
 		scheme = "https"
-		wsScheme = "wss"
 	}
-	return fmt.Sprintf("%s://%s", scheme, r.Host), fmt.Sprintf("%s://%s/acp", wsScheme, r.Host)
+	return fmt.Sprintf("%s://%s/ws", scheme, r.Host)
+}
+
+func workspaceLegacyACPBaseURL(r *http.Request) string {
+	scheme := "ws"
+	if r.TLS != nil {
+		scheme = "wss"
+	}
+	return fmt.Sprintf("%s://%s/acp", scheme, r.Host)
 }
 
 func (s *Server) workspaceManagerInfo(r *http.Request) workspaceManagerInfo {
-	apiURL, acpURL := workspaceBaseURLs(r)
 	return workspaceManagerInfo{
 		Name:      s.workspaceName,
 		Status:    "running",
-		ACP:       acpURL,
-		API:       apiURL,
+		ACP:       workspaceLegacyACPBaseURL(r),
+		API:       workspaceCanonicalAPIBaseURL(r),
 		CreatedAt: s.startedAt.Format(time.RFC3339),
 	}
 }

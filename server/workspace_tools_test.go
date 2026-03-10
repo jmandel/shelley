@@ -197,6 +197,107 @@ func TestWorkspaceToolsRejectDuplicateName(t *testing.T) {
 	}
 }
 
+func TestWorkspaceToolsStoreActionMetadataAndRuntimeSchema(t *testing.T) {
+	server, _, _ := newTestServer(t)
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	createWorkspaceTool(t, httpServer.URL, `{
+		"name":"crm",
+		"description":"CRM access",
+		"actions":[
+			{
+				"name":"read",
+				"description":"Read customer records",
+				"inputSchema":{
+					"type":"object",
+					"properties":{"customerId":{"type":"string"}},
+					"required":["customerId"],
+					"additionalProperties":false
+				}
+			},
+			{
+				"name":"search",
+				"description":"Search customers",
+				"inputSchema":{
+					"type":"object",
+					"properties":{"query":{"type":"string"}},
+					"required":["query"],
+					"additionalProperties":false
+				}
+			}
+		]
+	}`)
+	createWorkspaceGrant(t, httpServer.URL, "crm", `{
+		"subject":"agent:*",
+		"actions":["read"],
+		"access":"allowed"
+	}`)
+
+	toolInfo := getWorkspaceToolInfo(t, httpServer.URL, "crm")
+	if len(toolInfo.Actions) != 2 || toolInfo.Actions[0] != "read" || toolInfo.Actions[1] != "search" {
+		t.Fatalf("unexpected action names: %#v", toolInfo.Actions)
+	}
+	if len(toolInfo.ActionDefs) != 2 {
+		t.Fatalf("expected action defs in tool info, got %#v", toolInfo.ActionDefs)
+	}
+	if toolInfo.ActionDefs[0].Name != "read" || toolInfo.ActionDefs[0].Description != "Read customer records" {
+		t.Fatalf("unexpected first action def: %#v", toolInfo.ActionDefs[0])
+	}
+	if !json.Valid(toolInfo.ActionDefs[0].InputSchema) {
+		t.Fatalf("expected valid input schema in action def, got %q", string(toolInfo.ActionDefs[0].InputSchema))
+	}
+
+	runtimeTool := workspaceRuntimeTool(t, server, "alpha", "workspace_crm")
+	if !strings.Contains(runtimeTool.Description, "Read customer records") {
+		t.Fatalf("expected runtime tool description to include visible action description, got %q", runtimeTool.Description)
+	}
+	if strings.Contains(runtimeTool.Description, "Search customers") {
+		t.Fatalf("expected runtime tool description to omit non-granted action description, got %q", runtimeTool.Description)
+	}
+
+	schemaJSON := string(runtimeTool.InputSchema)
+	if !strings.Contains(schemaJSON, `"customerId"`) {
+		t.Fatalf("expected runtime tool schema to include granted action input schema, got %s", schemaJSON)
+	}
+	if strings.Contains(schemaJSON, `"query"`) {
+		t.Fatalf("expected runtime tool schema to omit non-granted action schema, got %s", schemaJSON)
+	}
+}
+
+func TestWorkspaceToolsRejectInvalidActionSchema(t *testing.T) {
+	server, _, _ := newTestServer(t)
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	req, err := http.NewRequest(http.MethodPost, httpServer.URL+"/ws/tools", bytes.NewBufferString(`{
+		"name":"broken",
+		"actions":[
+			{
+				"name":"read",
+				"inputSchema":{"type":"string"}
+			}
+		]
+	}`))
+	if err != nil {
+		t.Fatalf("failed to build invalid schema tool request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("failed to create invalid schema tool: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 from invalid schema tool create, got %d", resp.StatusCode)
+	}
+}
+
 func TestWorkspaceToolsRefreshActiveTopicTurns(t *testing.T) {
 	server, _, predictable := newTestServer(t)
 	mux := http.NewServeMux()
@@ -474,7 +575,7 @@ func TestWorkspaceToolApprovalResponseLogsApproved(t *testing.T) {
 func createWorkspaceTopic(t *testing.T, baseURL, topicName string) string {
 	t.Helper()
 
-	req, err := http.NewRequest(http.MethodPost, baseURL+"/topics", bytes.NewBufferString(`{"name":"`+topicName+`"}`))
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/ws/topics", bytes.NewBufferString(`{"name":"`+topicName+`"}`))
 	if err != nil {
 		t.Fatalf("failed to build topic create request: %v", err)
 	}

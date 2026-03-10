@@ -61,10 +61,11 @@ func (s *Server) buildTopicWorkspaceTools(ctx context.Context, topicName string)
 }
 
 func (s *Server) buildTopicWorkspaceTool(ctx context.Context, topicName string, toolRecord generated.WorkspaceTool) (*llm.Tool, error) {
-	registeredActions, err := decodeJSONStringSlice(toolRecord.Actions)
+	actionDefs, err := decodeWorkspaceActionDefs(toolRecord.Actions)
 	if err != nil {
 		return nil, err
 	}
+	registeredActions := workspaceActionNames(actionDefs)
 
 	var grantRecords []generated.WorkspaceGrant
 	if err := s.db.Queries(ctx, func(q *generated.Queries) error {
@@ -88,6 +89,7 @@ func (s *Server) buildTopicWorkspaceTool(ctx context.Context, topicName string, 
 	if len(visibleActions) == 0 {
 		return nil, nil
 	}
+	visibleActionDefs := visibleWorkspaceActionDefs(actionDefs, visibleActions)
 
 	toolCopy := toolRecord
 	policyCopy := cloneWorkspaceActionPolicies(actionPolicies)
@@ -96,30 +98,44 @@ func (s *Server) buildTopicWorkspaceTool(ctx context.Context, topicName string, 
 
 	return &llm.Tool{
 		Name:        "workspace_" + toolRecord.Name,
-		Description: buildWorkspaceToolDescription(toolRecord.Description, visibleActions),
-		InputSchema: buildWorkspaceToolSchema(visibleActions),
+		Description: buildWorkspaceToolDescription(toolRecord.Description, visibleActionDefs),
+		InputSchema: buildWorkspaceToolSchema(visibleActionDefs),
 		Run: func(ctx context.Context, input json.RawMessage) llm.ToolOut {
 			return s.runWorkspaceTool(ctx, topicName, toolCopy, actionsCopy, policyCopy, approversCopy, input)
 		},
 	}, nil
 }
 
-func buildWorkspaceToolDescription(description *string, actions []string) string {
+func buildWorkspaceToolDescription(description *string, actions []workspaceActionDef) string {
 	base := "Workspace-managed external tool."
 	if description != nil && strings.TrimSpace(*description) != "" {
 		base = strings.TrimSpace(*description)
 	}
-	return fmt.Sprintf("%s Allowed actions for this topic: %s.", base, strings.Join(actions, ", "))
+
+	if len(actions) == 0 {
+		return base
+	}
+
+	actionParts := make([]string, 0, len(actions))
+	for _, action := range actions {
+		if action.Description == "" {
+			actionParts = append(actionParts, action.Name)
+			continue
+		}
+		actionParts = append(actionParts, fmt.Sprintf("%s (%s)", action.Name, action.Description))
+	}
+	return fmt.Sprintf("%s Allowed actions for this topic: %s.", base, strings.Join(actionParts, ", "))
 }
 
-func buildWorkspaceToolSchema(actions []string) json.RawMessage {
-	schema, err := json.Marshal(map[string]any{
+func buildWorkspaceToolSchema(actions []workspaceActionDef) json.RawMessage {
+	actionNames := workspaceActionNames(actions)
+	schemaMap := map[string]any{
 		"type":     "object",
 		"required": []string{"action"},
 		"properties": map[string]any{
 			"action": map[string]any{
 				"type":        "string",
-				"enum":        actions,
+				"enum":        actionNames,
 				"description": "Workspace tool action to perform.",
 			},
 			"input": map[string]any{
@@ -128,8 +144,44 @@ func buildWorkspaceToolSchema(actions []string) json.RawMessage {
 				"additionalProperties": true,
 			},
 		},
-		"additionalProperties": true,
-	})
+		"additionalProperties": false,
+	}
+
+	var variants []any
+	for _, action := range actions {
+		inputSchema, err := workspaceActionSchemaAny(action)
+		if err != nil {
+			panic(err)
+		}
+		required := []string{"action"}
+		if len(action.InputSchema) > 0 {
+			required = append(required, "input")
+		}
+
+		actionSchema := map[string]any{
+			"type":     "object",
+			"required": required,
+			"properties": map[string]any{
+				"action": map[string]any{
+					"type":        "string",
+					"const":       action.Name,
+					"description": "Workspace tool action to perform.",
+				},
+				"input": inputSchema,
+			},
+			"additionalProperties": false,
+		}
+		if action.Description != "" {
+			actionSchema["description"] = action.Description
+			actionSchema["properties"].(map[string]any)["action"].(map[string]any)["description"] = action.Description
+		}
+		variants = append(variants, actionSchema)
+	}
+	if len(variants) > 0 {
+		schemaMap["oneOf"] = variants
+	}
+
+	schema, err := json.Marshal(schemaMap)
 	if err != nil {
 		panic(err)
 	}

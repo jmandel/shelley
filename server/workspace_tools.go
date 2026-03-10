@@ -30,6 +30,7 @@ type workspaceToolInfo struct {
 	Description   string                 `json:"description,omitempty"`
 	Protocol      string                 `json:"protocol"`
 	Actions       []string               `json:"actions"`
+	ActionDefs    []workspaceActionInfo  `json:"actionDefs,omitempty"`
 	Provider      string                 `json:"provider,omitempty"`
 	CredentialRef string                 `json:"credentialRef,omitempty"`
 	Config        json.RawMessage        `json:"config,omitempty"`
@@ -77,7 +78,7 @@ func (s *Server) handleWorkspaceToolsCreate(w http.ResponseWriter, r *http.Reque
 		Name          string          `json:"name"`
 		Description   string          `json:"description"`
 		Protocol      string          `json:"protocol"`
-		Actions       []string        `json:"actions"`
+		Actions       json.RawMessage `json:"actions"`
 		Provider      string          `json:"provider"`
 		CredentialRef string          `json:"credentialRef"`
 		Config        json.RawMessage `json:"config"`
@@ -92,15 +93,17 @@ func (s *Server) handleWorkspaceToolsCreate(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "name required", http.StatusBadRequest)
 		return
 	}
-	if len(req.Actions) == 0 {
-		http.Error(w, "actions required", http.StatusBadRequest)
-		return
-	}
 	if req.Protocol == "" {
 		req.Protocol = "mcp"
 	}
 
-	actionsJSON, err := json.Marshal(req.Actions)
+	actionDefs, err := normalizeWorkspaceActionDefs(req.Actions)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	actionsJSON, err := json.Marshal(actionDefs)
 	if err != nil {
 		http.Error(w, "Invalid actions", http.StatusBadRequest)
 		return
@@ -257,12 +260,13 @@ func (s *Server) handleWorkspaceToolGrants(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	toolActions, err := decodeJSONStringSlice(tool.Actions)
+	toolActionDefs, err := decodeWorkspaceActionDefs(tool.Actions)
 	if err != nil {
 		s.logger.Error("Failed to decode workspace tool actions", "tool", toolName, "error", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
+	toolActions := workspaceActionNames(toolActionDefs)
 	for _, action := range req.Actions {
 		if !containsString(toolActions, action) {
 			http.Error(w, "unknown action for tool", http.StatusBadRequest)
@@ -385,18 +389,19 @@ func (s *Server) workspaceToolInfo(ctx context.Context, tool generated.Workspace
 		}
 	}
 
-	actions, err := decodeJSONStringSlice(tool.Actions)
+	actionDefs, err := decodeWorkspaceActionDefs(tool.Actions)
 	if err != nil {
 		return workspaceToolInfo{}, err
 	}
 
 	info := workspaceToolInfo{
-		ToolID:    tool.ToolID,
-		Name:      tool.Name,
-		Protocol:  tool.Protocol,
-		Actions:   actions,
-		CreatedAt: tool.CreatedAt.Format(time.RFC3339),
-		Grants:    make([]workspaceGrantInfo, 0, len(grants)),
+		ToolID:     tool.ToolID,
+		Name:       tool.Name,
+		Protocol:   tool.Protocol,
+		Actions:    workspaceActionNames(actionDefs),
+		ActionDefs: workspaceActionInfos(actionDefs),
+		CreatedAt:  tool.CreatedAt.Format(time.RFC3339),
+		Grants:     make([]workspaceGrantInfo, 0, len(grants)),
 	}
 	if includeLog {
 		info.Log = make([]workspaceToolLogInfo, 0, len(logs))

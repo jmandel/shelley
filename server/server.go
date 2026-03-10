@@ -297,35 +297,7 @@ func (s *Server) RegisterNotificationChannel(ch notifications.Channel) {
 
 // RegisterRoutes registers HTTP routes on the given mux
 func (s *Server) RegisterRoutes(mux *http.ServeMux) {
-	mux.Handle("GET /health", http.HandlerFunc(s.handleWorkspaceHealth))
-	mux.Handle("GET /topics", http.HandlerFunc(s.handleWorkspaceTopics))
-	mux.Handle("POST /topics", http.HandlerFunc(s.handleWorkspaceTopics))
-	mux.Handle("GET /topics/{name}", http.HandlerFunc(s.handleWorkspaceTopic))
-	mux.Handle("DELETE /topics/{name}", http.HandlerFunc(s.handleWorkspaceTopic))
-	mux.Handle("GET /acp", http.HandlerFunc(s.handleWorkspaceTopicQueryWS))
-	mux.Handle("GET /acp/{topic}", http.HandlerFunc(s.handleWorkspaceTopicWS))
-	mux.Handle("GET /ws/health", http.HandlerFunc(s.handleWorkspaceHealth))
-	mux.Handle("GET /ws/topics", http.HandlerFunc(s.handleWorkspaceTopics))
-	mux.Handle("POST /ws/topics", http.HandlerFunc(s.handleWorkspaceTopics))
-	mux.Handle("GET /ws/topics/{name}", http.HandlerFunc(s.handleWorkspaceTopic))
-	mux.Handle("DELETE /ws/topics/{name}", http.HandlerFunc(s.handleWorkspaceTopic))
-	mux.Handle("GET /ws/files", http.HandlerFunc(s.handleWorkspaceFile))
-	mux.Handle("GET /ws/files/{$}", http.HandlerFunc(s.handleWorkspaceFile))
-	mux.Handle("GET /ws/files/{path...}", http.HandlerFunc(s.handleWorkspaceFile))
-	mux.Handle("PUT /ws/files/{path...}", http.HandlerFunc(s.handleWorkspaceFile))
-	mux.Handle("DELETE /ws/files/{path...}", http.HandlerFunc(s.handleWorkspaceFile))
-	mux.Handle("GET /ws/tools", http.HandlerFunc(s.handleWorkspaceTools))
-	mux.Handle("POST /ws/tools", http.HandlerFunc(s.handleWorkspaceTools))
-	mux.Handle("GET /ws/tools/{tool}", http.HandlerFunc(s.handleWorkspaceTool))
-	mux.Handle("DELETE /ws/tools/{tool}", http.HandlerFunc(s.handleWorkspaceTool))
-	mux.Handle("POST /ws/tools/{tool}/grants", http.HandlerFunc(s.handleWorkspaceToolGrants))
-	mux.Handle("DELETE /ws/tools/{tool}/grants/{grant}", http.HandlerFunc(s.handleWorkspaceToolGrant))
-	mux.Handle("GET /ws/topic/{name}", http.HandlerFunc(s.handleWorkspaceTopicWSByName))
-	mux.Handle("GET /ws/acp", http.HandlerFunc(s.handleWorkspaceTopicQueryWS))
-	mux.Handle("GET /ws/acp/{topic}", http.HandlerFunc(s.handleWorkspaceTopicWS))
-	mux.Handle("GET /workspaces", http.HandlerFunc(s.handleWorkspaceManager))
-	mux.Handle("POST /workspaces", http.HandlerFunc(s.handleWorkspaceManager))
-	mux.Handle("GET /workspaces/{name}", http.HandlerFunc(s.handleWorkspaceManagerWorkspace))
+	s.registerWorkspaceRoutes(mux)
 
 	// API routes - wrap with gzip where beneficial
 	mux.Handle("/api/conversations", gzipHandler(http.HandlerFunc(s.handleConversations)))
@@ -386,6 +358,51 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 
 	// Serve embedded UI assets
 	mux.Handle("/", s.staticHandler(ui.Assets()))
+}
+
+func (s *Server) registerWorkspaceRoutes(mux *http.ServeMux) {
+	s.registerCanonicalWorkspaceRoutes(mux)
+	s.registerWorkspaceCompatibilityRoutes(mux)
+}
+
+func (s *Server) registerCanonicalWorkspaceRoutes(mux *http.ServeMux) {
+	mux.Handle("GET /ws/health", http.HandlerFunc(s.handleWorkspaceHealth))
+	mux.Handle("GET /ws/topics", http.HandlerFunc(s.handleWorkspaceTopics))
+	mux.Handle("POST /ws/topics", http.HandlerFunc(s.handleWorkspaceTopics))
+	mux.Handle("GET /ws/topics/{name}", http.HandlerFunc(s.handleWorkspaceTopic))
+	mux.Handle("DELETE /ws/topics/{name}", http.HandlerFunc(s.handleWorkspaceTopic))
+	mux.Handle("GET /ws/files", http.HandlerFunc(s.handleWorkspaceFile))
+	mux.Handle("GET /ws/files/{$}", http.HandlerFunc(s.handleWorkspaceFile))
+	mux.Handle("GET /ws/files/{path...}", http.HandlerFunc(s.handleWorkspaceFile))
+	mux.Handle("PUT /ws/files/{path...}", http.HandlerFunc(s.handleWorkspaceFile))
+	mux.Handle("DELETE /ws/files/{path...}", http.HandlerFunc(s.handleWorkspaceFile))
+	mux.Handle("GET /ws/tools", http.HandlerFunc(s.handleWorkspaceTools))
+	mux.Handle("POST /ws/tools", http.HandlerFunc(s.handleWorkspaceTools))
+	mux.Handle("GET /ws/tools/{tool}", http.HandlerFunc(s.handleWorkspaceTool))
+	mux.Handle("DELETE /ws/tools/{tool}", http.HandlerFunc(s.handleWorkspaceTool))
+	mux.Handle("POST /ws/tools/{tool}/grants", http.HandlerFunc(s.handleWorkspaceToolGrants))
+	mux.Handle("DELETE /ws/tools/{tool}/grants/{grant}", http.HandlerFunc(s.handleWorkspaceToolGrant))
+	mux.Handle("GET /ws/topic/{name}", http.HandlerFunc(s.handleWorkspaceTopicWSByName))
+}
+
+func (s *Server) registerWorkspaceCompatibilityRoutes(mux *http.ServeMux) {
+	// Root-scoped runtime routes remain for wmlet-style compatibility.
+	mux.Handle("GET /health", http.HandlerFunc(s.handleWorkspaceHealth))
+	mux.Handle("GET /topics", http.HandlerFunc(s.handleWorkspaceTopics))
+	mux.Handle("POST /topics", http.HandlerFunc(s.handleWorkspaceTopics))
+	mux.Handle("GET /topics/{name}", http.HandlerFunc(s.handleWorkspaceTopic))
+	mux.Handle("DELETE /topics/{name}", http.HandlerFunc(s.handleWorkspaceTopic))
+
+	// ACP aliases remain for the checked-out Bun CLI and wmlet-style clients.
+	mux.Handle("GET /acp", http.HandlerFunc(s.handleWorkspaceTopicQueryWS))
+	mux.Handle("GET /acp/{topic}", http.HandlerFunc(s.handleWorkspaceTopicWS))
+	mux.Handle("GET /ws/acp", http.HandlerFunc(s.handleWorkspaceTopicQueryWS))
+	mux.Handle("GET /ws/acp/{topic}", http.HandlerFunc(s.handleWorkspaceTopicWS))
+
+	// Single-workspace manager shim remains for the checked-out Bun CLI.
+	mux.Handle("GET /workspaces", http.HandlerFunc(s.handleWorkspaceManager))
+	mux.Handle("POST /workspaces", http.HandlerFunc(s.handleWorkspaceManager))
+	mux.Handle("GET /workspaces/{name}", http.HandlerFunc(s.handleWorkspaceManagerWorkspace))
 }
 
 // handleValidateCwd validates that a path exists and is a directory

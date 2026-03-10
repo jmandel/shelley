@@ -32,7 +32,7 @@ func TestWorkspaceTopicsLifecycle(t *testing.T) {
 	defer httpServer.Close()
 
 	createBody := bytes.NewBufferString(`{"name":"debug timeout"}`)
-	createReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/topics", createBody)
+	createReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/ws/topics", createBody)
 	if err != nil {
 		t.Fatalf("failed to build create request: %v", err)
 	}
@@ -61,7 +61,7 @@ func TestWorkspaceTopicsLifecycle(t *testing.T) {
 		t.Fatalf("expected RFC3339 createdAt, got %q: %v", created.CreatedAt, err)
 	}
 
-	topicResp, err := http.Get(httpServer.URL + "/topics/debug-timeout")
+	topicResp, err := http.Get(httpServer.URL + "/ws/topics/debug-timeout")
 	if err != nil {
 		t.Fatalf("failed to get topic: %v", err)
 	}
@@ -81,7 +81,7 @@ func TestWorkspaceTopicsLifecycle(t *testing.T) {
 		t.Fatalf("expected 0 clients before websocket connect, got %d", fetched.Clients)
 	}
 
-	topicsResp, err := http.Get(httpServer.URL + "/topics")
+	topicsResp, err := http.Get(httpServer.URL + "/ws/topics")
 	if err != nil {
 		t.Fatalf("failed to list topics: %v", err)
 	}
@@ -98,7 +98,7 @@ func TestWorkspaceTopicsLifecycle(t *testing.T) {
 		t.Fatalf("expected one topic named debug-timeout, got %#v", topics)
 	}
 
-	deleteReq, err := http.NewRequest(http.MethodDelete, httpServer.URL+"/topics/debug-timeout", nil)
+	deleteReq, err := http.NewRequest(http.MethodDelete, httpServer.URL+"/ws/topics/debug-timeout", nil)
 	if err != nil {
 		t.Fatalf("failed to build delete request: %v", err)
 	}
@@ -111,7 +111,7 @@ func TestWorkspaceTopicsLifecycle(t *testing.T) {
 		t.Fatalf("expected 200 from delete, got %d", deleteResp.StatusCode)
 	}
 
-	notFoundResp, err := http.Get(httpServer.URL + "/topics/debug-timeout")
+	notFoundResp, err := http.Get(httpServer.URL + "/ws/topics/debug-timeout")
 	if err != nil {
 		t.Fatalf("failed to get archived topic: %v", err)
 	}
@@ -121,7 +121,7 @@ func TestWorkspaceTopicsLifecycle(t *testing.T) {
 	}
 
 	recreateBody := bytes.NewBufferString(`{"name":"debug-timeout"}`)
-	recreateReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/topics", recreateBody)
+	recreateReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/ws/topics", recreateBody)
 	if err != nil {
 		t.Fatalf("failed to build recreate request: %v", err)
 	}
@@ -217,6 +217,9 @@ func TestWorkspaceAliasRoutesAndManagerDiscovery(t *testing.T) {
 	if len(workspaces) != 1 || workspaces[0].Name != "test-workspace" {
 		t.Fatalf("unexpected /workspaces response: %#v", workspaces)
 	}
+	if !strings.HasSuffix(workspaces[0].API, "/ws") {
+		t.Fatalf("expected manager api base URL to end with /ws, got %q", workspaces[0].API)
+	}
 	if !strings.HasSuffix(workspaces[0].ACP, "/acp") {
 		t.Fatalf("expected manager acp base URL to end with /acp, got %q", workspaces[0].ACP)
 	}
@@ -252,13 +255,22 @@ func TestWorkspaceAliasRoutesAndManagerDiscovery(t *testing.T) {
 		t.Fatalf("expected 201 from /workspaces POST, got %d", managerCreateResp.StatusCode)
 	}
 
-	precreatedResp, err := http.Get(httpServer.URL + "/topics/precreated")
+	precreatedResp, err := http.Get(httpServer.URL + "/ws/topics/precreated")
 	if err != nil {
 		t.Fatalf("failed to get precreated topic: %v", err)
 	}
 	defer precreatedResp.Body.Close()
 	if precreatedResp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200 for precreated topic, got %d", precreatedResp.StatusCode)
+	}
+
+	rootTopicsResp, err := http.Get(httpServer.URL + "/topics")
+	if err != nil {
+		t.Fatalf("failed to call root /topics compatibility route: %v", err)
+	}
+	defer rootTopicsResp.Body.Close()
+	if rootTopicsResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 from root /topics compatibility route, got %d", rootTopicsResp.StatusCode)
 	}
 }
 
@@ -274,7 +286,7 @@ func TestWorkspaceTopicsUseConfiguredWorkspaceRoot(t *testing.T) {
 	httpServer := httptest.NewServer(mux)
 	defer httpServer.Close()
 
-	createReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/topics", bytes.NewBufferString(`{"name":"rooted-topic"}`))
+	createReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/ws/topics", bytes.NewBufferString(`{"name":"rooted-topic"}`))
 	if err != nil {
 		t.Fatalf("failed to build rooted topic create request: %v", err)
 	}
@@ -315,7 +327,7 @@ func TestWorkspaceTopicsDoNotListLegacyConversation(t *testing.T) {
 	httpServer := httptest.NewServer(mux)
 	defer httpServer.Close()
 
-	resp, err := http.Get(httpServer.URL + "/topics")
+	resp, err := http.Get(httpServer.URL + "/ws/topics")
 	if err != nil {
 		t.Fatalf("failed to list topics: %v", err)
 	}
@@ -361,7 +373,7 @@ func TestWorkspaceTopicWSQueuesPrompt(t *testing.T) {
 		t.Fatalf("failed to send second prompt: %v", err)
 	}
 
-	topicInfo := getWorkspaceTopicInfo(t, httpServer.URL+"/topics/general")
+	topicInfo := getWorkspaceTopicInfo(t, httpServer.URL+"/ws/topics/general")
 	if topicInfo.Clients != 1 {
 		t.Fatalf("expected connected topic to report 1 client, got %d", topicInfo.Clients)
 	}
@@ -416,7 +428,7 @@ func TestWorkspaceTopicWSPromptBroadcastsToSSE(t *testing.T) {
 	httpServer := httptest.NewServer(mux)
 	defer httpServer.Close()
 
-	createReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/topics", bytes.NewBufferString(`{"name":"sse-collab"}`))
+	createReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/ws/topics", bytes.NewBufferString(`{"name":"sse-collab"}`))
 	if err != nil {
 		t.Fatalf("failed to build create request: %v", err)
 	}
@@ -477,7 +489,7 @@ func TestWorkspaceTopicAPIChatUsesTopicQueue(t *testing.T) {
 	httpServer := httptest.NewServer(mux)
 	defer httpServer.Close()
 
-	createReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/topics", bytes.NewBufferString(`{"name":"shared-api"}`))
+	createReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/ws/topics", bytes.NewBufferString(`{"name":"shared-api"}`))
 	if err != nil {
 		t.Fatalf("failed to build create request: %v", err)
 	}
@@ -577,7 +589,7 @@ func TestWorkspaceTopicAPIChatRestoresRuntimeFromPersistedTopic(t *testing.T) {
 	httpServer := httptest.NewServer(mux)
 	defer httpServer.Close()
 
-	createReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/topics", bytes.NewBufferString(`{"name":"restored-runtime"}`))
+	createReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/ws/topics", bytes.NewBufferString(`{"name":"restored-runtime"}`))
 	if err != nil {
 		t.Fatalf("failed to build create request: %v", err)
 	}
@@ -651,7 +663,7 @@ func TestRenameTopicConversationKeepsWorkspaceTopicRouting(t *testing.T) {
 	httpServer := httptest.NewServer(mux)
 	defer httpServer.Close()
 
-	createReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/topics", bytes.NewBufferString(`{"name":"rename-me"}`))
+	createReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/ws/topics", bytes.NewBufferString(`{"name":"rename-me"}`))
 	if err != nil {
 		t.Fatalf("failed to build create request: %v", err)
 	}
@@ -686,7 +698,7 @@ func TestRenameTopicConversationKeepsWorkspaceTopicRouting(t *testing.T) {
 		t.Fatalf("expected 200 from rename, got %d", renameResp.StatusCode)
 	}
 
-	oldTopicResp, err := http.Get(httpServer.URL + "/topics/rename-me")
+	oldTopicResp, err := http.Get(httpServer.URL + "/ws/topics/rename-me")
 	if err != nil {
 		t.Fatalf("failed to get old topic name: %v", err)
 	}
@@ -695,7 +707,7 @@ func TestRenameTopicConversationKeepsWorkspaceTopicRouting(t *testing.T) {
 		t.Fatalf("expected old topic name to disappear, got %d", oldTopicResp.StatusCode)
 	}
 
-	newTopicResp, err := http.Get(httpServer.URL + "/topics/renamed-topic")
+	newTopicResp, err := http.Get(httpServer.URL + "/ws/topics/renamed-topic")
 	if err != nil {
 		t.Fatalf("failed to get renamed topic: %v", err)
 	}
@@ -755,7 +767,7 @@ func TestEmitWorkspaceWSMessagesTranslatesToolLifecycle(t *testing.T) {
 	toolRawStr := string(toolRaw)
 
 	messages, turnComplete = translateWorkspaceWSMessagesForAPIMessage(toolTitles, APIMessage{
-		Type:    string(dbpkg.MessageTypeTool),
+		Type:    string(dbpkg.MessageTypeUser),
 		LlmData: &toolRawStr,
 	})
 	if turnComplete {

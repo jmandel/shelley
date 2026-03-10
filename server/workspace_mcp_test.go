@@ -245,7 +245,7 @@ func TestWorkspaceToolMCPApprovalExecutesAfterApproval(t *testing.T) {
 	defer conn.Close(websocket.StatusNormalClosure, "test complete")
 
 	waitForConnectedMessage(t, ctx, conn)
-	sessionID := getWorkspaceTopicInfo(t, httpServer.URL+"/topics/mcp-approval").SessionID
+	sessionID := getWorkspaceTopicInfo(t, httpServer.URL+"/ws/topics/mcp-approval").SessionID
 
 	if err := wsjson.Write(ctx, conn, workspacePromptMessage{
 		Type: "prompt",
@@ -279,6 +279,7 @@ func TestWorkspaceToolMCPApprovalExecutesAfterApproval(t *testing.T) {
 	}
 
 	var toolCalled bool
+	var toolUpdated bool
 	var received []workspaceWSMessage
 	for {
 		msg := readWorkspaceWSMessage(t, ctx, conn)
@@ -286,12 +287,18 @@ func TestWorkspaceToolMCPApprovalExecutesAfterApproval(t *testing.T) {
 		if msg.Type == "tool_call" && msg.Title == "workspace_approval-greeter" {
 			toolCalled = true
 		}
+		if msg.Type == "tool_update" && msg.Title == "workspace_approval-greeter" && msg.Status == "completed" {
+			toolUpdated = true
+		}
 		if msg.Type == "done" {
 			break
 		}
 	}
 	if !toolCalled {
 		t.Fatalf("expected workspace tool call after approval, got %#v", received)
+	}
+	if !toolUpdated {
+		t.Fatalf("expected workspace tool update after approval, got %#v", received)
 	}
 
 	waitFor(t, 2*time.Second, func() bool {
