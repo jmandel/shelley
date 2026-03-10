@@ -323,19 +323,47 @@ func (t *Topic) QueueSnapshot() workspaceQueueSnapshot {
 		Entries:        make([]workspaceQueueEntry, 0, len(snapshot.Entries)),
 	}
 	for i, prompt := range snapshot.Entries {
-		resp.Entries = append(resp.Entries, workspaceQueueEntry{
-			PromptID:  prompt.PromptID,
-			Status:    string(prompt.Status),
-			Text:      prompt.Text,
-			CreatedAt: prompt.QueuedAt.Format(time.RFC3339),
-			Position:  i + 1,
-			SubmittedBy: workspaceSubjectRef{
-				Kind: "participant",
-				ID:   prompt.SenderID,
-			},
-		})
+		resp.Entries = append(resp.Entries, workspaceQueueEntryFromPrompt(prompt, i+1))
 	}
 	return resp
+}
+
+func (t *Topic) UpdateQueuedPrompt(promptID, senderID, text string) error {
+	updated, position, err := t.PromptQueue.Update(promptID, senderID, text)
+	if err != nil {
+		return err
+	}
+	t.broadcastQueueEvent(workspaceWSMessage{
+		Type:     "queue_entry_updated",
+		PromptID: updated.PromptID,
+		Data:     updated.Text,
+		Position: position,
+		SubmittedBy: &workspaceSubjectRef{
+			Kind: "participant",
+			ID:   updated.SenderID,
+		},
+	})
+	t.broadcastQueueSnapshot()
+	return nil
+}
+
+func (t *Topic) MoveQueuedPrompt(promptID, senderID, direction string) error {
+	moved, position, err := t.PromptQueue.Move(promptID, senderID, direction)
+	if err != nil {
+		return err
+	}
+	t.broadcastQueueEvent(workspaceWSMessage{
+		Type:      "queue_entry_moved",
+		PromptID:  moved.PromptID,
+		Direction: direction,
+		Position:  position,
+		SubmittedBy: &workspaceSubjectRef{
+			Kind: "participant",
+			ID:   moved.SenderID,
+		},
+	})
+	t.broadcastQueueSnapshot()
+	return nil
 }
 
 func (t *Topic) CancelQueuedPrompt(promptID, senderID string) error {
@@ -486,4 +514,18 @@ func (t *Topic) broadcastQueueSnapshot() {
 		ActivePromptID: snapshot.ActivePromptID,
 		Entries:        snapshot.Entries,
 	})
+}
+
+func workspaceQueueEntryFromPrompt(prompt QueuedPrompt, position int) workspaceQueueEntry {
+	return workspaceQueueEntry{
+		PromptID:  prompt.PromptID,
+		Status:    string(prompt.Status),
+		Text:      prompt.Text,
+		CreatedAt: prompt.QueuedAt.Format(time.RFC3339),
+		Position:  position,
+		SubmittedBy: workspaceSubjectRef{
+			Kind: "participant",
+			ID:   prompt.SenderID,
+		},
+	}
 }

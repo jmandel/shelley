@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"shelley.exe.dev/llm"
 )
@@ -24,6 +25,7 @@ import (
 //   - "subagent: <slug> <prompt>" - triggers subagent tool
 //   - "change_dir: <path>" - triggers change_dir tool
 //   - "delay: <seconds>" - delays response by specified seconds
+//   - "ws ..." - demo-oriented shorthand for local tools, MCP tools, and targeted delays
 //   - See Do() method for complete list of supported patterns
 type PredictableService struct {
 	// TokenContextWindow size
@@ -32,6 +34,27 @@ type PredictableService struct {
 	// Recent requests for testing inspection
 	recentRequests []*llm.Request
 	responseDelay  time.Duration
+}
+
+type wsDemoScript struct {
+	PreDelay   time.Duration
+	ToolDelay  time.Duration
+	AfterDelay time.Duration
+	Verb       string
+	Text       string
+	ToolName   string
+	ToolAction string
+	ToolInput  json.RawMessage
+	AfterText  string
+}
+
+func (s wsDemoScript) usesTool() bool {
+	switch s.Verb {
+	case "bash", "validator", "publisher", "jira", "tool":
+		return true
+	default:
+		return false
+	}
 }
 
 // NewPredictableService creates a new predictable LLM service
@@ -83,23 +106,16 @@ func (s *PredictableService) Do(ctx context.Context, req *llm.Request) (*llm.Res
 	inputTokens := s.countRequestTokens(req)
 
 	// Extract the text content from the last user message
-	var inputText string
-	var hasToolResult bool
-	if len(req.Messages) > 0 {
-		lastMessage := req.Messages[len(req.Messages)-1]
-		if lastMessage.Role == llm.MessageRoleUser {
-			for _, content := range lastMessage.Content {
-				if content.Type == llm.ContentTypeText {
-					inputText = strings.TrimSpace(content.Text)
-				} else if content.Type == llm.ContentTypeToolResult {
-					hasToolResult = true
-				}
-			}
-		}
-	}
+	inputText, latestUserText, hasToolResult := predictableInputContext(req)
 
 	// If the message is purely a tool result (no text), acknowledge it and end turn
 	if hasToolResult && inputText == "" {
+		if script, err := parseWSDemoScript(latestUserText); err == nil && script.usesTool() {
+			if err := waitPredictableDelay(ctx, script.AfterDelay); err != nil {
+				return nil, err
+			}
+			return s.makeResponse(script.AfterText, inputTokens), nil
+		}
 		return s.makeResponse("Done.", inputTokens), nil
 	}
 
@@ -222,18 +238,378 @@ func (s *PredictableService) Do(ctx context.Context, req *llm.Request) (*llm.Res
 			delaySeconds, err := strconv.ParseFloat(delayStr, 64)
 			if err == nil && delaySeconds > 0 {
 				delayDuration := time.Duration(delaySeconds * float64(time.Second))
-				select {
-				case <-time.After(delayDuration):
-				case <-ctx.Done():
-					return nil, ctx.Err()
+				if err := waitPredictableDelay(ctx, delayDuration); err != nil {
+					return nil, err
 				}
 			}
 			return s.makeResponse(fmt.Sprintf("Delayed for %s seconds", delayStr), inputTokens), nil
 		}
 
+		if strings.HasPrefix(inputText, "ws ") || strings.HasPrefix(inputText, "ws: ") || inputText == "ws" || inputText == "ws:" {
+			script, err := parseWSDemoScript(inputText)
+			if err != nil {
+				return s.makeResponse(err.Error(), inputTokens), nil
+			}
+			return s.makeWSDemoResponse(ctx, req, script, inputTokens)
+		}
+
 		// Default response for undefined inputs
 		return s.makeResponse("edit predictable.go to add a response for that one...", inputTokens), nil
 	}
+}
+
+func predictableInputContext(req *llm.Request) (currentText, latestUserText string, hasToolResult bool) {
+	if req == nil || len(req.Messages) == 0 {
+		return "", "", false
+	}
+
+	lastMessage := req.Messages[len(req.Messages)-1]
+	if lastMessage.Role == llm.MessageRoleUser {
+		for _, content := range lastMessage.Content {
+			if content.Type == llm.ContentTypeText {
+				currentText = strings.TrimSpace(content.Text)
+			} else if content.Type == llm.ContentTypeToolResult {
+				hasToolResult = true
+			}
+		}
+	}
+
+	for i := len(req.Messages) - 1; i >= 0; i-- {
+		msg := req.Messages[i]
+		if msg.Role != llm.MessageRoleUser {
+			continue
+		}
+		for j := len(msg.Content) - 1; j >= 0; j-- {
+			content := msg.Content[j]
+			if content.Type == llm.ContentTypeText {
+				latestUserText = strings.TrimSpace(content.Text)
+				if latestUserText != "" {
+					return currentText, latestUserText, hasToolResult
+				}
+			}
+		}
+	}
+
+	return currentText, latestUserText, hasToolResult
+}
+
+func parseWSDemoScript(inputText string) (wsDemoScript, error) {
+	trimmed := strings.TrimSpace(inputText)
+	args := ""
+	switch {
+	case trimmed == "ws" || trimmed == "ws:":
+		return wsDemoScript{}, fmt.Errorf("ws usage: ws [pauseN|pause N] [toolpauseN|toolpause N] [afterpauseN|afterpause N] text|bash|validator|publisher|jira|tool ...")
+	case strings.HasPrefix(trimmed, "ws:"):
+		args = strings.TrimSpace(strings.TrimPrefix(trimmed, "ws:"))
+	case strings.HasPrefix(trimmed, "ws "):
+		args = strings.TrimSpace(strings.TrimPrefix(trimmed, "ws "))
+	default:
+		return wsDemoScript{}, fmt.Errorf("not a ws command")
+	}
+
+	if args == "" {
+		return wsDemoScript{}, fmt.Errorf("ws usage: ws [pauseN|pause N] [toolpauseN|toolpause N] [afterpauseN|afterpause N] text|bash|validator|publisher|jira|tool ...")
+	}
+
+	fields, err := splitWSDemoArgs(args)
+	if err != nil {
+		return wsDemoScript{}, err
+	}
+	script := wsDemoScript{}
+	for idx := 0; idx < len(fields); idx++ {
+		token := fields[idx]
+		switch {
+		case strings.HasPrefix(token, "toolpause"):
+			delay, matched, err := parseWSDemoDelayToken("toolpause", token)
+			if err != nil {
+				return wsDemoScript{}, err
+			}
+			if matched {
+				script.ToolDelay = delay
+				continue
+			}
+		case strings.HasPrefix(token, "afterpause"):
+			delay, matched, err := parseWSDemoDelayToken("afterpause", token)
+			if err != nil {
+				return wsDemoScript{}, err
+			}
+			if matched {
+				script.AfterDelay = delay
+				continue
+			}
+		case strings.HasPrefix(token, "pause"):
+			delay, matched, err := parseWSDemoDelayToken("pause", token)
+			if err != nil {
+				return wsDemoScript{}, err
+			}
+			if matched {
+				script.PreDelay = delay
+				continue
+			}
+		}
+
+		switch token {
+		case "pause", "toolpause", "afterpause":
+			if idx+1 >= len(fields) {
+				return wsDemoScript{}, fmt.Errorf("%s requires a duration", token)
+			}
+			delay, err := parseWSDemoDelayValue(fields[idx+1])
+			if err != nil {
+				return wsDemoScript{}, fmt.Errorf("invalid %s value %q", token, fields[idx+1])
+			}
+			switch token {
+			case "pause":
+				script.PreDelay = delay
+			case "toolpause":
+				script.ToolDelay = delay
+			case "afterpause":
+				script.AfterDelay = delay
+			}
+			idx++
+		case "text", "echo":
+			value, err := consumeWSDemoValue(fields, &idx, token)
+			if err != nil {
+				return wsDemoScript{}, err
+			}
+			if err := script.setVerb("text"); err != nil {
+				return wsDemoScript{}, err
+			}
+			script.Text = value
+		case "bash":
+			value, err := consumeWSDemoValue(fields, &idx, token)
+			if err != nil {
+				return wsDemoScript{}, err
+			}
+			if err := script.setVerb("bash"); err != nil {
+				return wsDemoScript{}, err
+			}
+			script.Text = value
+		case "validator":
+			value, err := consumeWSDemoValue(fields, &idx, token)
+			if err != nil {
+				return wsDemoScript{}, err
+			}
+			if err := script.setVerb("validator"); err != nil {
+				return wsDemoScript{}, err
+			}
+			script.Text = value
+		case "publisher":
+			value, err := consumeWSDemoValue(fields, &idx, token)
+			if err != nil {
+				return wsDemoScript{}, err
+			}
+			if err := script.setVerb("publisher"); err != nil {
+				return wsDemoScript{}, err
+			}
+			script.Text = value
+		case "jira":
+			value, err := consumeWSDemoValue(fields, &idx, token)
+			if err != nil {
+				return wsDemoScript{}, err
+			}
+			if err := script.setVerb("jira"); err != nil {
+				return wsDemoScript{}, err
+			}
+			script.Text = value
+		case "tool":
+			value, err := consumeWSDemoValue(fields, &idx, token)
+			if err != nil {
+				return wsDemoScript{}, err
+			}
+			if err := script.setVerb("tool"); err != nil {
+				return wsDemoScript{}, err
+			}
+			script.ToolName = value
+		case "action":
+			value, err := consumeWSDemoValue(fields, &idx, token)
+			if err != nil {
+				return wsDemoScript{}, err
+			}
+			script.ToolAction = value
+		case "input":
+			value, err := consumeWSDemoValue(fields, &idx, token)
+			if err != nil {
+				return wsDemoScript{}, err
+			}
+			input := json.RawMessage(value)
+			if !json.Valid(input) {
+				return wsDemoScript{}, fmt.Errorf("ws input must be valid JSON")
+			}
+			script.ToolInput = input
+		case "aftertext":
+			value, err := consumeWSDemoValue(fields, &idx, token)
+			if err != nil {
+				return wsDemoScript{}, err
+			}
+			script.AfterText = value
+		default:
+			return wsDemoScript{}, fmt.Errorf("unknown ws tag %q", token)
+		}
+	}
+
+	if script.AfterText == "" {
+		script.AfterText = "Done."
+	}
+
+	if script.Verb == "" {
+		return wsDemoScript{}, fmt.Errorf("ws requires one of: text, bash, validator, publisher, jira, tool")
+	}
+	if script.Verb == "tool" {
+		if script.ToolName == "" || script.ToolAction == "" {
+			return wsDemoScript{}, fmt.Errorf("ws tool requires both tool <name> and action <action>")
+		}
+	}
+
+	return script, nil
+}
+
+func (s *wsDemoScript) setVerb(verb string) error {
+	if s.Verb != "" && s.Verb != verb {
+		return fmt.Errorf("ws only supports one primary action")
+	}
+	s.Verb = verb
+	return nil
+}
+
+func consumeWSDemoValue(fields []string, idx *int, tag string) (string, error) {
+	if *idx+1 >= len(fields) {
+		return "", fmt.Errorf("%s requires a value", tag)
+	}
+	*idx = *idx + 1
+	return fields[*idx], nil
+}
+
+func splitWSDemoArgs(input string) ([]string, error) {
+	var fields []string
+	var current strings.Builder
+	var quote rune
+	escaped := false
+
+	flush := func() {
+		if current.Len() == 0 {
+			return
+		}
+		fields = append(fields, current.String())
+		current.Reset()
+	}
+
+	for _, r := range input {
+		switch {
+		case escaped:
+			current.WriteRune(r)
+			escaped = false
+		case r == '\\':
+			escaped = true
+		case quote != 0:
+			if r == quote {
+				quote = 0
+			} else {
+				current.WriteRune(r)
+			}
+		case r == '"' || r == '\'':
+			quote = r
+		case unicode.IsSpace(r):
+			flush()
+		default:
+			current.WriteRune(r)
+		}
+	}
+
+	if escaped {
+		return nil, fmt.Errorf("unterminated escape in ws command")
+	}
+	if quote != 0 {
+		return nil, fmt.Errorf("unterminated quote in ws command")
+	}
+	flush()
+	return fields, nil
+}
+
+func parseWSDemoDelayToken(prefix, token string) (time.Duration, bool, error) {
+	if !strings.HasPrefix(token, prefix) || token == prefix {
+		return 0, false, nil
+	}
+	delay, err := parseWSDemoDelayValue(strings.TrimPrefix(token, prefix))
+	if err != nil {
+		return 0, true, fmt.Errorf("invalid %s value %q", prefix, token)
+	}
+	return delay, true, nil
+}
+
+func parseWSDemoDelayValue(raw string) (time.Duration, error) {
+	if raw == "" {
+		return 0, fmt.Errorf("missing delay")
+	}
+	if delay, err := time.ParseDuration(raw); err == nil {
+		return delay, nil
+	}
+	seconds, err := strconv.ParseFloat(raw, 64)
+	if err != nil || seconds < 0 {
+		return 0, fmt.Errorf("invalid delay %q", raw)
+	}
+	return time.Duration(seconds * float64(time.Second)), nil
+}
+
+func waitPredictableDelay(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return nil
+	}
+	select {
+	case <-time.After(delay):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *PredictableService) makeWSDemoResponse(ctx context.Context, req *llm.Request, script wsDemoScript, inputTokens uint64) (*llm.Response, error) {
+	if err := waitPredictableDelay(ctx, script.PreDelay); err != nil {
+		return nil, err
+	}
+
+	switch script.Verb {
+	case "text", "say", "echo":
+		return s.makeResponse(script.Text, inputTokens), nil
+	case "bash":
+		return s.makeBashToolResponse(wsDemoCommandWithToolPause(script.Text, script.ToolDelay), inputTokens), nil
+	case "validator":
+		command := "fhir-validator"
+		if script.Text != "" {
+			command += " " + script.Text
+		}
+		return s.makeBashToolResponse(wsDemoCommandWithToolPause(command, script.ToolDelay), inputTokens), nil
+	case "publisher":
+		command := "ig-publisher"
+		if script.Text != "" {
+			command += " " + script.Text
+		}
+		return s.makeBashToolResponse(wsDemoCommandWithToolPause(command, script.ToolDelay), inputTokens), nil
+	case "jira":
+		if !s.requestHasTool(req, "workspace_hl7-jira") {
+			return s.makeResponse("workspace tool unavailable", inputTokens), nil
+		}
+		input, _ := json.Marshal(map[string]string{"query": script.Text})
+		return s.makeWorkspaceToolResponse("hl7-jira", "jira.search", json.RawMessage(input), inputTokens), nil
+	case "tool":
+		if !s.requestHasTool(req, "workspace_"+script.ToolName) {
+			return s.makeResponse("workspace tool unavailable", inputTokens), nil
+		}
+		return s.makeWorkspaceToolResponse(script.ToolName, script.ToolAction, script.ToolInput, inputTokens), nil
+	default:
+		return s.makeResponse("ws: unknown action", inputTokens), nil
+	}
+}
+
+func wsDemoCommandWithToolPause(command string, delay time.Duration) string {
+	command = strings.TrimSpace(command)
+	if delay <= 0 {
+		return command
+	}
+	delaySpec := strconv.FormatFloat(delay.Seconds(), 'f', -1, 64)
+	if command == "" {
+		return "sleep " + delaySpec
+	}
+	return "sleep " + delaySpec + "; " + command
 }
 
 // makeMaxTokensResponse creates a response that simulates hitting max_tokens limit

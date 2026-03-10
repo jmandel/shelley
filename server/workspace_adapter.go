@@ -48,6 +48,7 @@ type workspaceWSMessage struct {
 	Position       int                   `json:"position,omitempty"`
 	Reason         string                `json:"reason,omitempty"`
 	Removed        []string              `json:"removed,omitempty"`
+	Direction      string                `json:"direction,omitempty"`
 	ToolCallID     string                `json:"toolCallId,omitempty"`
 	Title          string                `json:"title,omitempty"`
 	Kind           string                `json:"kind,omitempty"`
@@ -92,6 +93,14 @@ type workspaceQueueSnapshot struct {
 
 type workspaceQueueClearResponse struct {
 	Removed []string `json:"removed"`
+}
+
+type workspaceQueueUpdateRequest struct {
+	Text string `json:"text"`
+}
+
+type workspaceQueueMoveRequest struct {
+	Direction string `json:"direction"`
 }
 
 type workspaceManagerInfo struct {
@@ -488,11 +497,6 @@ func (s *Server) handleWorkspaceTopicQueue(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *Server) handleWorkspaceTopicQueueEntry(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodDelete {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
 	topicName, err := sanitizeTopicName(r.PathValue("name"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -515,21 +519,33 @@ func (s *Server) handleWorkspaceTopicQueueEntry(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	if err := topic.CancelQueuedPrompt(promptID, workspaceRequesterID(r)); err != nil {
-		switch {
-		case errors.Is(err, ErrQueuedPromptNotFound):
-			http.Error(w, err.Error(), http.StatusNotFound)
-		case errors.Is(err, ErrQueuedPromptNotOwned):
-			http.Error(w, err.Error(), http.StatusForbidden)
-		case errors.Is(err, ErrQueuedPromptNotCancellable):
-			http.Error(w, err.Error(), http.StatusConflict)
-		default:
-			http.Error(w, err.Error(), http.StatusBadRequest)
+	switch r.Method {
+	case http.MethodDelete:
+		if err := topic.CancelQueuedPrompt(promptID, workspaceRequesterID(r)); err != nil {
+			writeWorkspaceQueueMutationError(w, err)
+			return
 		}
-		return
+		w.WriteHeader(http.StatusNoContent)
+	case http.MethodPatch:
+		var req workspaceQueueUpdateRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid JSON", http.StatusBadRequest)
+			return
+		}
+		req.Text = strings.TrimSpace(req.Text)
+		if req.Text == "" {
+			http.Error(w, "text is required", http.StatusBadRequest)
+			return
+		}
+		if err := topic.UpdateQueuedPrompt(promptID, workspaceRequesterID(r), req.Text); err != nil {
+			writeWorkspaceQueueMutationError(w, err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(topic.QueueSnapshot())
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
-
-	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) handleWorkspaceTopicQueueClearMine(w http.ResponseWriter, r *http.Request) {
@@ -558,6 +574,54 @@ func (s *Server) handleWorkspaceTopicQueueClearMine(w http.ResponseWriter, r *ht
 	removed := topic.ClearQueuedPromptsForSender(workspaceRequesterID(r))
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(workspaceQueueClearResponse{Removed: removed})
+}
+
+func (s *Server) handleWorkspaceTopicQueueMove(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	topicName, err := sanitizeTopicName(r.PathValue("name"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	promptID := strings.TrimSpace(r.PathValue("prompt"))
+	if promptID == "" {
+		http.Error(w, "promptId is required", http.StatusBadRequest)
+		return
+	}
+
+	var req workspaceQueueMoveRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+	req.Direction = strings.TrimSpace(req.Direction)
+	if req.Direction == "" {
+		http.Error(w, "direction is required", http.StatusBadRequest)
+		return
+	}
+
+	topic, err := s.resolveWorkspaceTopicRuntime(r.Context(), topicName)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "Topic not found", http.StatusNotFound)
+			return
+		}
+		s.logger.Error("Failed to resolve workspace topic runtime for queue move", "topic", topicName, "error", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	if err := topic.MoveQueuedPrompt(promptID, workspaceRequesterID(r), req.Direction); err != nil {
+		writeWorkspaceQueueMutationError(w, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(topic.QueueSnapshot())
 }
 
 func (s *Server) resolveWorkspaceTopicRuntime(ctx context.Context, topicName string) (*Topic, error) {
@@ -1056,6 +1120,21 @@ func workspaceRequesterID(r *http.Request) string {
 		return senderID
 	}
 	return ""
+}
+
+func writeWorkspaceQueueMutationError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, ErrQueuedPromptNotFound):
+		http.Error(w, err.Error(), http.StatusNotFound)
+	case errors.Is(err, ErrQueuedPromptNotOwned):
+		http.Error(w, err.Error(), http.StatusForbidden)
+	case errors.Is(err, ErrQueuedPromptNotCancellable):
+		http.Error(w, err.Error(), http.StatusConflict)
+	case errors.Is(err, ErrQueuedPromptInvalidMove):
+		http.Error(w, err.Error(), http.StatusBadRequest)
+	default:
+		http.Error(w, err.Error(), http.StatusBadRequest)
+	}
 }
 
 func llmMessageText(message llm.Message) string {

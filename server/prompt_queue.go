@@ -22,6 +22,7 @@ var (
 	ErrQueuedPromptNotFound       = errors.New("queued prompt not found")
 	ErrQueuedPromptNotCancellable = errors.New("queued prompt is not cancellable")
 	ErrQueuedPromptNotOwned       = errors.New("queued prompt is not owned by requester")
+	ErrQueuedPromptInvalidMove    = errors.New("queued prompt move direction must be up, down, top, or bottom")
 )
 
 type QueuedPrompt struct {
@@ -118,9 +119,7 @@ func (pq *PromptQueue) Cancel(promptID, senderID string) (QueuedPrompt, int, err
 		if prompt.PromptID != promptID {
 			continue
 		}
-		if senderID == "" || prompt.SenderID != senderID {
-			return QueuedPrompt{}, 0, ErrQueuedPromptNotOwned
-		}
+		_ = senderID
 		removed := prompt
 		removed.Status = PromptStatusCancelled
 		pq.queue = append(pq.queue[:i], pq.queue[i+1:]...)
@@ -149,6 +148,70 @@ func (pq *PromptQueue) CancelMine(senderID string) []QueuedPrompt {
 	}
 	pq.queue = filtered
 	return removed
+}
+
+func (pq *PromptQueue) Update(promptID, senderID, text string) (QueuedPrompt, int, error) {
+	pq.mu.Lock()
+	defer pq.mu.Unlock()
+
+	if pq.active != nil && pq.active.PromptID == promptID {
+		return QueuedPrompt{}, 0, ErrQueuedPromptNotCancellable
+	}
+	for i, prompt := range pq.queue {
+		if prompt.PromptID != promptID {
+			continue
+		}
+		_ = senderID
+		prompt.Text = text
+		pq.queue[i] = prompt
+		return prompt, i + 1, nil
+	}
+	return QueuedPrompt{}, 0, ErrQueuedPromptNotFound
+}
+
+func (pq *PromptQueue) Move(promptID, senderID, direction string) (QueuedPrompt, int, error) {
+	pq.mu.Lock()
+	defer pq.mu.Unlock()
+
+	if pq.active != nil && pq.active.PromptID == promptID {
+		return QueuedPrompt{}, 0, ErrQueuedPromptNotCancellable
+	}
+	for i, prompt := range pq.queue {
+		if prompt.PromptID != promptID {
+			continue
+		}
+		_ = senderID
+
+		target := i
+		switch direction {
+		case "up":
+			if i > 0 {
+				target = i - 1
+			}
+		case "down":
+			if i < len(pq.queue)-1 {
+				target = i + 1
+			}
+		case "top":
+			target = 0
+		case "bottom":
+			target = len(pq.queue) - 1
+		default:
+			return QueuedPrompt{}, 0, ErrQueuedPromptInvalidMove
+		}
+
+		if target != i {
+			moved := pq.queue[i]
+			if target < i {
+				copy(pq.queue[target+1:i+1], pq.queue[target:i])
+			} else {
+				copy(pq.queue[i:target], pq.queue[i+1:target+1])
+			}
+			pq.queue[target] = moved
+		}
+		return pq.queue[target], target + 1, nil
+	}
+	return QueuedPrompt{}, 0, ErrQueuedPromptNotFound
 }
 
 func (pq *PromptQueue) Snapshot() PromptQueueSnapshot {

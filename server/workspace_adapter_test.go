@@ -495,6 +495,123 @@ func TestWorkspaceTopicQueueRESTAndCancellation(t *testing.T) {
 	}
 }
 
+func TestWorkspaceTopicQueueRESTUpdateAndMove(t *testing.T) {
+	t.Setenv("PREDICTABLE_DELAY_MS", "250")
+
+	server, _, _ := newTestServer(t)
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws/topic/queue-edit?client_id=cli-a"
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("failed to dial websocket: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "test complete")
+	waitForConnectedMessage(t, ctx, conn)
+
+	for _, prompt := range []workspacePromptMessage{
+		{Type: "prompt", PromptID: "p-1", Data: "echo: first"},
+		{Type: "prompt", PromptID: "p-2", Data: "echo: second"},
+		{Type: "prompt", PromptID: "p-3", Data: "echo: third"},
+	} {
+		if err := wsjson.Write(ctx, conn, prompt); err != nil {
+			t.Fatalf("failed to enqueue %s: %v", prompt.PromptID, err)
+		}
+	}
+
+	waitFor(t, 2*time.Second, func() bool {
+		req, err := http.NewRequest(http.MethodGet, httpServer.URL+"/ws/topics/queue-edit/queue", nil)
+		if err != nil {
+			return false
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			return false
+		}
+		defer resp.Body.Close()
+		var snapshot workspaceQueueSnapshot
+		if err := json.NewDecoder(resp.Body).Decode(&snapshot); err != nil {
+			return false
+		}
+		return snapshot.ActivePromptID == "p-1" &&
+			len(snapshot.Entries) == 2 &&
+			snapshot.Entries[0].PromptID == "p-2" &&
+			snapshot.Entries[1].PromptID == "p-3"
+	})
+
+	updateReq, err := http.NewRequest(http.MethodPatch, httpServer.URL+"/ws/topics/queue-edit/queue/p-3", bytes.NewBufferString(`{"text":"echo: revised third"}`))
+	if err != nil {
+		t.Fatalf("failed to build queue patch request: %v", err)
+	}
+	updateReq.Header.Set("Content-Type", "application/json")
+	updateReq.Header.Set("X-Workspace-Client-ID", "cli-b")
+	updateResp, err := http.DefaultClient.Do(updateReq)
+	if err != nil {
+		t.Fatalf("failed to patch queued prompt: %v", err)
+	}
+	if updateResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(updateResp.Body)
+		updateResp.Body.Close()
+		t.Fatalf("expected 200 from queue patch, got %d: %s", updateResp.StatusCode, string(body))
+	}
+	var updatedSnapshot workspaceQueueSnapshot
+	if err := json.NewDecoder(updateResp.Body).Decode(&updatedSnapshot); err != nil {
+		updateResp.Body.Close()
+		t.Fatalf("failed to decode queue patch response: %v", err)
+	}
+	updateResp.Body.Close()
+	if got := updatedSnapshot.Entries[1].Text; got != "echo: revised third" {
+		t.Fatalf("expected updated queue text, got %q", got)
+	}
+
+	var updatedSeen bool
+	for !updatedSeen {
+		msg := readWorkspaceWSMessage(t, ctx, conn)
+		if msg.Type == "queue_entry_updated" && msg.PromptID == "p-3" && msg.Data == "echo: revised third" {
+			updatedSeen = true
+		}
+	}
+
+	moveReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/ws/topics/queue-edit/queue/p-3/move", bytes.NewBufferString(`{"direction":"top"}`))
+	if err != nil {
+		t.Fatalf("failed to build queue move request: %v", err)
+	}
+	moveReq.Header.Set("Content-Type", "application/json")
+	moveReq.Header.Set("X-Workspace-Client-ID", "cli-b")
+	moveResp, err := http.DefaultClient.Do(moveReq)
+	if err != nil {
+		t.Fatalf("failed to move queued prompt: %v", err)
+	}
+	if moveResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(moveResp.Body)
+		moveResp.Body.Close()
+		t.Fatalf("expected 200 from queue move, got %d: %s", moveResp.StatusCode, string(body))
+	}
+	var movedSnapshot workspaceQueueSnapshot
+	if err := json.NewDecoder(moveResp.Body).Decode(&movedSnapshot); err != nil {
+		moveResp.Body.Close()
+		t.Fatalf("failed to decode queue move response: %v", err)
+	}
+	moveResp.Body.Close()
+	if got := movedSnapshot.Entries[0].PromptID; got != "p-3" {
+		t.Fatalf("expected moved prompt to be first in queue, got %q", got)
+	}
+
+	var movedSeen bool
+	for !movedSeen {
+		msg := readWorkspaceWSMessage(t, ctx, conn)
+		if msg.Type == "queue_entry_moved" && msg.PromptID == "p-3" && msg.Direction == "top" && msg.Position == 1 {
+			movedSeen = true
+		}
+	}
+}
+
 func TestWorkspaceTopicWSReplaysRecentMessagesOnConnect(t *testing.T) {
 	server, _, _ := newTestServer(t)
 	mux := http.NewServeMux()

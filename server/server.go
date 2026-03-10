@@ -372,7 +372,9 @@ func (s *Server) registerCanonicalWorkspaceRoutes(mux *http.ServeMux) {
 	mux.Handle("GET /ws/topics/{name}", http.HandlerFunc(s.handleWorkspaceTopic))
 	mux.Handle("DELETE /ws/topics/{name}", http.HandlerFunc(s.handleWorkspaceTopic))
 	mux.Handle("GET /ws/topics/{name}/queue", http.HandlerFunc(s.handleWorkspaceTopicQueue))
+	mux.Handle("PATCH /ws/topics/{name}/queue/{prompt}", http.HandlerFunc(s.handleWorkspaceTopicQueueEntry))
 	mux.Handle("DELETE /ws/topics/{name}/queue/{prompt}", http.HandlerFunc(s.handleWorkspaceTopicQueueEntry))
+	mux.Handle("POST /ws/topics/{name}/queue/{prompt}/move", http.HandlerFunc(s.handleWorkspaceTopicQueueMove))
 	mux.Handle("POST /ws/topics/{name}/queue:clear-mine", http.HandlerFunc(s.handleWorkspaceTopicQueueClearMine))
 	mux.Handle("GET /ws/files", http.HandlerFunc(s.handleWorkspaceFile))
 	mux.Handle("GET /ws/files/{$}", http.HandlerFunc(s.handleWorkspaceFile))
@@ -396,7 +398,9 @@ func (s *Server) registerWorkspaceCompatibilityRoutes(mux *http.ServeMux) {
 	mux.Handle("GET /topics/{name}", http.HandlerFunc(s.handleWorkspaceTopic))
 	mux.Handle("DELETE /topics/{name}", http.HandlerFunc(s.handleWorkspaceTopic))
 	mux.Handle("GET /topics/{name}/queue", http.HandlerFunc(s.handleWorkspaceTopicQueue))
+	mux.Handle("PATCH /topics/{name}/queue/{prompt}", http.HandlerFunc(s.handleWorkspaceTopicQueueEntry))
 	mux.Handle("DELETE /topics/{name}/queue/{prompt}", http.HandlerFunc(s.handleWorkspaceTopicQueueEntry))
+	mux.Handle("POST /topics/{name}/queue/{prompt}/move", http.HandlerFunc(s.handleWorkspaceTopicQueueMove))
 	mux.Handle("POST /topics/{name}/queue:clear-mine", http.HandlerFunc(s.handleWorkspaceTopicQueueClearMine))
 
 	// ACP aliases remain for the checked-out Bun CLI and wmlet-style clients.

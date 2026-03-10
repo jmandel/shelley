@@ -231,6 +231,160 @@ func TestPredictableServiceDelay(t *testing.T) {
 	}
 }
 
+func TestPredictableServiceWSDemoTextTaggedArgs(t *testing.T) {
+	service := NewPredictableService()
+
+	ctx := context.Background()
+	req := &llm.Request{
+		Messages: []llm.Message{
+			{Role: llm.MessageRoleUser, Content: []llm.Content{{Type: llm.ContentTypeText, Text: `ws pause0.05 text "thanks, what should we do next?"`}}},
+		},
+	}
+
+	start := time.Now()
+	resp, err := service.Do(ctx, req)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("ws text failed: %v", err)
+	}
+	if elapsed < 50*time.Millisecond {
+		t.Fatalf("expected at least 50ms delay, got %v", elapsed)
+	}
+	if got := resp.Content[0].Text; got != "thanks, what should we do next?" {
+		t.Fatalf("unexpected ws text response %q", got)
+	}
+}
+
+func TestPredictableServiceWSDemoJiraTaggedArgs(t *testing.T) {
+	service := NewPredictableService()
+
+	ctx := context.Background()
+	req := &llm.Request{
+		Messages: []llm.Message{
+			{Role: llm.MessageRoleUser, Content: []llm.Content{{Type: llm.ContentTypeText, Text: `ws jira "validation error handling" pause0.05`}}},
+		},
+		Tools: []*llm.Tool{{Name: "workspace_hl7-jira"}},
+	}
+
+	start := time.Now()
+	resp, err := service.Do(ctx, req)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("ws jira failed: %v", err)
+	}
+	if elapsed < 50*time.Millisecond {
+		t.Fatalf("expected at least 50ms delay, got %v", elapsed)
+	}
+	if resp.StopReason != llm.StopReasonToolUse {
+		t.Fatalf("expected tool use stop reason, got %v", resp.StopReason)
+	}
+
+	var toolUse *llm.Content
+	for i := range resp.Content {
+		if resp.Content[i].Type == llm.ContentTypeToolUse {
+			toolUse = &resp.Content[i]
+			break
+		}
+	}
+	if toolUse == nil {
+		t.Fatal("expected workspace tool use")
+	}
+	if got := toolUse.ToolName; got != "workspace_hl7-jira" {
+		t.Fatalf("expected workspace_hl7-jira, got %q", got)
+	}
+
+	var input struct {
+		Action string          `json:"action"`
+		Input  json.RawMessage `json:"input"`
+	}
+	if err := json.Unmarshal(toolUse.ToolInput, &input); err != nil {
+		t.Fatalf("failed to decode workspace tool input: %v", err)
+	}
+	if input.Action != "jira.search" {
+		t.Fatalf("expected jira.search action, got %q", input.Action)
+	}
+	var payload map[string]string
+	if err := json.Unmarshal(input.Input, &payload); err != nil {
+		t.Fatalf("failed to decode jira payload: %v", err)
+	}
+	if payload["query"] != "validation error handling" {
+		t.Fatalf("unexpected jira query payload %#v", payload)
+	}
+}
+
+func TestPredictableServiceWSDemoToolPauseAndAfterText(t *testing.T) {
+	service := NewPredictableService()
+	ctx := context.Background()
+	prompt := `ws validator "input/fsh/BloodPressurePanel.fsh" toolpause0.05 afterpause0.05 aftertext "Validator finished."`
+
+	initialReq := &llm.Request{
+		Messages: []llm.Message{
+			{Role: llm.MessageRoleUser, Content: []llm.Content{{Type: llm.ContentTypeText, Text: prompt}}},
+		},
+	}
+
+	initialResp, err := service.Do(ctx, initialReq)
+	if err != nil {
+		t.Fatalf("ws validator failed: %v", err)
+	}
+	if initialResp.StopReason != llm.StopReasonToolUse {
+		t.Fatalf("expected tool use stop reason, got %v", initialResp.StopReason)
+	}
+
+	var toolUse *llm.Content
+	for i := range initialResp.Content {
+		if initialResp.Content[i].Type == llm.ContentTypeToolUse {
+			toolUse = &initialResp.Content[i]
+			break
+		}
+	}
+	if toolUse == nil {
+		t.Fatal("expected bash tool use content")
+	}
+	if toolUse.ToolName != "bash" {
+		t.Fatalf("expected bash tool, got %q", toolUse.ToolName)
+	}
+	var bashInput map[string]string
+	if err := json.Unmarshal(toolUse.ToolInput, &bashInput); err != nil {
+		t.Fatalf("failed to decode bash input: %v", err)
+	}
+	command := bashInput["command"]
+	if !strings.Contains(command, "sleep 0.05;") || !strings.Contains(command, "fhir-validator input/fsh/BloodPressurePanel.fsh") {
+		t.Fatalf("unexpected validator command %q", command)
+	}
+
+	continuationReq := &llm.Request{
+		Messages: []llm.Message{
+			{Role: llm.MessageRoleUser, Content: []llm.Content{{Type: llm.ContentTypeText, Text: prompt}}},
+			{Role: llm.MessageRoleAssistant, Content: initialResp.Content},
+			{
+				Role: llm.MessageRoleUser,
+				Content: []llm.Content{{
+					Type:      llm.ContentTypeToolResult,
+					ToolUseID: toolUse.ID,
+					ToolResult: []llm.Content{{
+						Type: llm.ContentTypeText,
+						Text: "validator output",
+					}},
+				}},
+			},
+		},
+	}
+
+	start := time.Now()
+	finalResp, err := service.Do(ctx, continuationReq)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("ws continuation failed: %v", err)
+	}
+	if elapsed < 50*time.Millisecond {
+		t.Fatalf("expected at least 50ms afterpause delay, got %v", elapsed)
+	}
+	if got := finalResp.Content[0].Text; got != "Validator finished." {
+		t.Fatalf("unexpected continuation response %q", got)
+	}
+}
+
 func TestLoopWithPredictableService(t *testing.T) {
 	var recordedMessages []llm.Message
 	var recordedUsages []llm.Usage
