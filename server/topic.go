@@ -124,6 +124,24 @@ func (tm *TopicManager) RemoveTopicRuntime(topicName string) {
 	}
 }
 
+func (tm *TopicManager) RenameTopic(conversationID, topicName string, conversation *generated.Conversation) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	topic := tm.topicsByConversationID[conversationID]
+	if topic == nil {
+		return
+	}
+
+	delete(tm.topics, topic.Name)
+	topic.Name = topicName
+	topic.Config.Name = topicName
+	if conversation != nil {
+		topic.Conversation = conversation
+	}
+	tm.topics[topicName] = topic
+}
+
 func newTopic(server *Server, manager *ConversationManager, conversation *generated.Conversation, cfg TopicConfig) *Topic {
 	logger := server.logger
 	if logger == nil {

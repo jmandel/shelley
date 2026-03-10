@@ -208,7 +208,7 @@ func (s *Server) handleWorkspaceTopicsCreate(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	info, err := s.workspaceTopicInfo(r.Context(), r, *topic.Conversation)
+	info, err := s.workspaceTopicInfo(r.Context(), r, topicName, *topic.Conversation)
 	if err != nil {
 		s.logger.Error("Failed to build workspace topic info", "topic", topicName, "error", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
@@ -240,7 +240,7 @@ func (s *Server) handleWorkspaceTopic(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		info, err := s.workspaceTopicInfo(r.Context(), r, *conversation)
+		info, err := s.workspaceTopicInfo(r.Context(), r, topicName, *conversation)
 		if err != nil {
 			s.logger.Error("Failed to build workspace topic info", "topic", topicName, "error", err)
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
@@ -383,17 +383,18 @@ func (s *Server) handleWorkspaceTopicWSForName(w http.ResponseWriter, r *http.Re
 }
 
 func (s *Server) workspaceTopics(ctx context.Context, r *http.Request) ([]workspaceTopicInfo, error) {
-	conversations, err := s.db.ListConversations(ctx, 5000, 0)
+	topicRecords, err := s.listActiveTopicRecords(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	topics := make([]workspaceTopicInfo, 0, len(conversations))
-	for _, conversation := range conversations {
-		if conversation.Slug == nil || conversation.Archived {
-			continue
+	topics := make([]workspaceTopicInfo, 0, len(topicRecords))
+	for _, topicRecord := range topicRecords {
+		conversation, err := s.db.GetConversationByID(ctx, topicRecord.ConversationID)
+		if err != nil {
+			return nil, err
 		}
-		info, err := s.workspaceTopicInfo(ctx, r, conversation)
+		info, err := s.workspaceTopicInfo(ctx, r, topicRecord.TopicName, *conversation)
 		if err != nil {
 			return nil, err
 		}
@@ -403,22 +404,19 @@ func (s *Server) workspaceTopics(ctx context.Context, r *http.Request) ([]worksp
 }
 
 func (s *Server) workspaceTopicNames(ctx context.Context) ([]string, error) {
-	conversations, err := s.db.ListConversations(ctx, 5000, 0)
+	topicRecords, err := s.listActiveTopicRecords(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	topics := make([]string, 0, len(conversations))
-	for _, conversation := range conversations {
-		if conversation.Slug == nil || conversation.Archived {
-			continue
-		}
-		topics = append(topics, *conversation.Slug)
+	topics := make([]string, 0, len(topicRecords))
+	for _, topicRecord := range topicRecords {
+		topics = append(topics, topicRecord.TopicName)
 	}
 	return topics, nil
 }
 
-func (s *Server) workspaceTopicInfo(ctx context.Context, r *http.Request, conversation generated.Conversation) (workspaceTopicInfo, error) {
+func (s *Server) workspaceTopicInfo(ctx context.Context, r *http.Request, topicName string, conversation generated.Conversation) (workspaceTopicInfo, error) {
 	logSize, err := s.countMessagesInConversation(ctx, conversation.ConversationID)
 	if err != nil {
 		return workspaceTopicInfo{}, err
@@ -426,21 +424,26 @@ func (s *Server) workspaceTopicInfo(ctx context.Context, r *http.Request, conver
 
 	clients := 0
 	busy := s.isConversationWorking(conversation.ConversationID)
-	if conversation.Slug != nil {
-		if topic := s.topicManager.GetTopic(*conversation.Slug); topic != nil {
-			clients = topic.ClientCount()
-			busy = topic.IsBusy()
-		}
+	if topic := s.topicManager.GetTopic(topicName); topic != nil {
+		clients = topic.ClientCount()
+		busy = topic.IsBusy()
+	}
+
+	createdAt := conversation.CreatedAt
+	if topicRecord, err := s.lookupTopicRecord(ctx, topicName); err != nil {
+		return workspaceTopicInfo{}, err
+	} else if topicRecord != nil {
+		createdAt = topicRecord.CreatedAt
 	}
 
 	return workspaceTopicInfo{
-		Name:      *conversation.Slug,
+		Name:      topicName,
 		SessionID: conversation.ConversationID,
 		Clients:   clients,
 		Busy:      busy,
 		LogSize:   logSize,
-		ACP:       workspaceTopicACPURL(r, *conversation.Slug),
-		CreatedAt: conversation.CreatedAt.Format(time.RFC3339),
+		ACP:       workspaceTopicACPURL(r, topicName),
+		CreatedAt: createdAt.Format(time.RFC3339),
 	}, nil
 }
 
@@ -494,10 +497,33 @@ func (s *Server) getOrCreateTopicConversation(ctx context.Context, topicName str
 		return nil, topicConversationExisting, err
 	}
 
+	if _, err := s.ensureTopicRecord(ctx, topicName, created.ConversationID); err != nil {
+		return nil, topicConversationExisting, err
+	}
+
 	return created, topicConversationCreated, nil
 }
 
 func (s *Server) lookupTopicConversation(ctx context.Context, topicName string) (*generated.Conversation, error) {
+	topicRecord, err := s.lookupTopicRecord(ctx, topicName)
+	if err != nil {
+		return nil, err
+	}
+	if topicRecord != nil {
+		return s.db.GetConversationByID(ctx, topicRecord.ConversationID)
+	}
+
+	conversation, err := s.lookupLegacyTopicConversation(ctx, topicName)
+	if err != nil || conversation == nil {
+		return conversation, err
+	}
+	if _, err := s.ensureTopicRecord(ctx, topicName, conversation.ConversationID); err != nil {
+		return nil, err
+	}
+	return conversation, nil
+}
+
+func (s *Server) lookupLegacyTopicConversation(ctx context.Context, topicName string) (*generated.Conversation, error) {
 	var conversation generated.Conversation
 	err := s.db.Queries(ctx, func(q *generated.Queries) error {
 		var err error
@@ -511,6 +537,103 @@ func (s *Server) lookupTopicConversation(ctx context.Context, topicName string) 
 		return nil, err
 	}
 	return &conversation, nil
+}
+
+func (s *Server) lookupTopicRecord(ctx context.Context, topicName string) (*generated.Topic, error) {
+	var topic generated.Topic
+	err := s.db.Queries(ctx, func(q *generated.Queries) error {
+		var err error
+		topic, err = q.GetTopic(ctx, topicName)
+		return err
+	})
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &topic, nil
+}
+
+func (s *Server) lookupTopicRecordByConversationID(ctx context.Context, conversationID string) (*generated.Topic, error) {
+	var topic generated.Topic
+	err := s.db.Queries(ctx, func(q *generated.Queries) error {
+		var err error
+		topic, err = q.GetTopicByConversationID(ctx, conversationID)
+		return err
+	})
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &topic, nil
+}
+
+func (s *Server) ensureTopicRecord(ctx context.Context, topicName, conversationID string) (*generated.Topic, error) {
+	topicRecord, err := s.lookupTopicRecord(ctx, topicName)
+	if err != nil {
+		return nil, err
+	}
+	if topicRecord != nil {
+		return topicRecord, nil
+	}
+
+	var created generated.Topic
+	err = s.db.QueriesTx(ctx, func(q *generated.Queries) error {
+		var err error
+		created, err = q.CreateTopic(ctx, generated.CreateTopicParams{
+			TopicName:      topicName,
+			ConversationID: conversationID,
+		})
+		return err
+	})
+	if err == nil {
+		return &created, nil
+	}
+
+	topicRecord, lookupErr := s.lookupTopicRecord(ctx, topicName)
+	if lookupErr == nil && topicRecord != nil {
+		return topicRecord, nil
+	}
+
+	topicRecord, lookupErr = s.lookupTopicRecordByConversationID(ctx, conversationID)
+	if lookupErr == nil && topicRecord != nil {
+		return topicRecord, nil
+	}
+
+	return nil, err
+}
+
+func (s *Server) listActiveTopicRecords(ctx context.Context) ([]generated.Topic, error) {
+	var topics []generated.Topic
+	err := s.db.Queries(ctx, func(q *generated.Queries) error {
+		var err error
+		topics, err = q.ListActiveTopics(ctx)
+		return err
+	})
+	return topics, err
+}
+
+func (s *Server) getOrCreateTopicByConversationID(ctx context.Context, conversationID string) (*Topic, bool, error) {
+	if topic := s.topicManager.GetTopicByConversationID(conversationID); topic != nil {
+		return topic, true, nil
+	}
+
+	topicRecord, err := s.lookupTopicRecordByConversationID(ctx, conversationID)
+	if err != nil {
+		return nil, false, err
+	}
+	if topicRecord == nil {
+		return nil, false, nil
+	}
+
+	topic, _, err := s.topicManager.GetOrCreateTopic(ctx, topicRecord.TopicName)
+	if err != nil {
+		return nil, false, err
+	}
+	return topic, true, nil
 }
 
 func (s *Server) latestSequenceID(ctx context.Context, conversationID string) (int64, error) {

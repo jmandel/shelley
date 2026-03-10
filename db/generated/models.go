@@ -83,3 +83,9 @@ type Setting struct {
 	Value     string    `json:"value"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
+
+type Topic struct {
+	TopicName      string    `json:"topic_name"`
+	ConversationID string    `json:"conversation_id"`
+	CreatedAt      time.Time `json:"created_at"`
+}

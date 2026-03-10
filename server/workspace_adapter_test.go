@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -13,8 +15,10 @@ import (
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 
+	"shelley.exe.dev/claudetool"
 	dbpkg "shelley.exe.dev/db"
 	"shelley.exe.dev/llm"
+	"shelley.exe.dev/loop"
 )
 
 func TestWorkspaceTopicsLifecycle(t *testing.T) {
@@ -255,6 +259,36 @@ func TestWorkspaceAliasRoutesAndManagerDiscovery(t *testing.T) {
 	}
 }
 
+func TestWorkspaceTopicsDoNotListLegacyConversation(t *testing.T) {
+	server, database, _ := newTestServer(t)
+	slug := "legacy-conversation"
+	if _, err := database.CreateConversation(context.Background(), &slug, true, nil, nil); err != nil {
+		t.Fatalf("failed to create legacy conversation: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	resp, err := http.Get(httpServer.URL + "/topics")
+	if err != nil {
+		t.Fatalf("failed to list topics: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 from list topics, got %d", resp.StatusCode)
+	}
+
+	var topics []workspaceTopicInfo
+	if err := json.NewDecoder(resp.Body).Decode(&topics); err != nil {
+		t.Fatalf("failed to decode topics response: %v", err)
+	}
+	if len(topics) != 0 {
+		t.Fatalf("expected legacy conversation to stay out of workspace topics, got %#v", topics)
+	}
+}
+
 func TestWorkspaceTopicWSQueuesPrompt(t *testing.T) {
 	t.Setenv("PREDICTABLE_DELAY_MS", "250")
 
@@ -428,6 +462,151 @@ func TestWorkspaceTopicAPIChatUsesTopicQueue(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected api chat prompt in predictable request, got %#v", lastRequest.Messages)
+	}
+}
+
+func TestWorkspaceTopicAPIChatRestoresRuntimeFromPersistedTopic(t *testing.T) {
+	t.Setenv("PREDICTABLE_DELAY_MS", "250")
+
+	server, database, _ := newTestServer(t)
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	createReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/topics", bytes.NewBufferString(`{"name":"restored-runtime"}`))
+	if err != nil {
+		t.Fatalf("failed to build create request: %v", err)
+	}
+	createReq.Header.Set("Content-Type", "application/json")
+
+	createResp, err := http.DefaultClient.Do(createReq)
+	if err != nil {
+		t.Fatalf("failed to create topic: %v", err)
+	}
+	defer createResp.Body.Close()
+	if createResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 from create, got %d", createResp.StatusCode)
+	}
+
+	var created workspaceTopicInfo
+	if err := json.NewDecoder(createResp.Body).Decode(&created); err != nil {
+		t.Fatalf("failed to decode create response: %v", err)
+	}
+
+	predictable := loop.NewPredictableService()
+	restarted := NewServer(
+		database,
+		&testLLMManager{service: predictable},
+		claudetool.ToolSetConfig{EnableBrowser: false},
+		slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelWarn})),
+		true,
+		"",
+		"predictable",
+		"",
+		nil,
+	)
+	if restarted.topicManager.GetTopicByConversationID(created.SessionID) != nil {
+		t.Fatal("expected restarted server to begin without an in-memory topic runtime")
+	}
+
+	chatReq := ChatRequest{Message: "echo: recovered", Model: "predictable"}
+	chatBody, err := json.Marshal(chatReq)
+	if err != nil {
+		t.Fatalf("failed to marshal chat request: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/conversation/"+created.SessionID+"/chat", bytes.NewReader(chatBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	restarted.handleChatConversation(w, req, created.SessionID)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 from restored api chat, got %d: %s", w.Code, w.Body.String())
+	}
+
+	waitFor(t, 2*time.Second, func() bool {
+		return restarted.topicManager.GetTopicByConversationID(created.SessionID) != nil
+	})
+	waitFor(t, 2*time.Second, func() bool {
+		return predictable.GetLastRequest() != nil
+	})
+
+	topic := restarted.topicManager.GetTopicByConversationID(created.SessionID)
+	if topic == nil || topic.Name != "restored-runtime" {
+		t.Fatalf("expected recovered topic runtime for restored-runtime, got %#v", topic)
+	}
+	if got := lastUserText(predictable.GetLastRequest()); got != "echo: recovered" {
+		t.Fatalf("expected recovered prompt to flow through topic runtime, got %q", got)
+	}
+}
+
+func TestRenameTopicConversationKeepsWorkspaceTopicRouting(t *testing.T) {
+	server, _, _ := newTestServer(t)
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	createReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/topics", bytes.NewBufferString(`{"name":"rename-me"}`))
+	if err != nil {
+		t.Fatalf("failed to build create request: %v", err)
+	}
+	createReq.Header.Set("Content-Type", "application/json")
+
+	createResp, err := http.DefaultClient.Do(createReq)
+	if err != nil {
+		t.Fatalf("failed to create topic: %v", err)
+	}
+	defer createResp.Body.Close()
+	if createResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 from create, got %d", createResp.StatusCode)
+	}
+
+	var created workspaceTopicInfo
+	if err := json.NewDecoder(createResp.Body).Decode(&created); err != nil {
+		t.Fatalf("failed to decode create response: %v", err)
+	}
+
+	renameReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/api/conversation/"+created.SessionID+"/rename", bytes.NewBufferString(`{"slug":"renamed-topic"}`))
+	if err != nil {
+		t.Fatalf("failed to build rename request: %v", err)
+	}
+	renameReq.Header.Set("Content-Type", "application/json")
+
+	renameResp, err := http.DefaultClient.Do(renameReq)
+	if err != nil {
+		t.Fatalf("failed to rename topic conversation: %v", err)
+	}
+	defer renameResp.Body.Close()
+	if renameResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 from rename, got %d", renameResp.StatusCode)
+	}
+
+	oldTopicResp, err := http.Get(httpServer.URL + "/topics/rename-me")
+	if err != nil {
+		t.Fatalf("failed to get old topic name: %v", err)
+	}
+	defer oldTopicResp.Body.Close()
+	if oldTopicResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected old topic name to disappear, got %d", oldTopicResp.StatusCode)
+	}
+
+	newTopicResp, err := http.Get(httpServer.URL + "/topics/renamed-topic")
+	if err != nil {
+		t.Fatalf("failed to get renamed topic: %v", err)
+	}
+	defer newTopicResp.Body.Close()
+	if newTopicResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 from renamed topic, got %d", newTopicResp.StatusCode)
+	}
+
+	var renamed workspaceTopicInfo
+	if err := json.NewDecoder(newTopicResp.Body).Decode(&renamed); err != nil {
+		t.Fatalf("failed to decode renamed topic response: %v", err)
+	}
+	if renamed.SessionID != created.SessionID {
+		t.Fatalf("expected renamed topic to keep session %q, got %q", created.SessionID, renamed.SessionID)
 	}
 }
 

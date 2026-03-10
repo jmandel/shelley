@@ -645,7 +645,11 @@ func (s *Server) handleChatConversation(w http.ResponseWriter, r *http.Request, 
 	}
 
 	userEmail := r.Header.Get("X-ExeDev-Email")
-	if topic := s.topicManager.GetTopicByConversationID(conversationID); topic != nil {
+	if topic, ok, err := s.getOrCreateTopicByConversationID(ctx, conversationID); err != nil {
+		s.logger.Error("Failed to resolve topic-backed conversation", "conversationID", conversationID, "error", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	} else if ok {
 		if req.Model != "" {
 			topicModelID := conversationModelID(*topic.Conversation, topic.Config.ModelID)
 			if topicModelID != "" && req.Model != topicModelID {
@@ -1276,11 +1280,39 @@ func (s *Server) handleRenameConversation(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	conversation, err := s.db.UpdateConversationSlug(ctx, conversationID, sanitized)
+	var conversation *generated.Conversation
+	renamedTopic := false
+	err := s.db.WithTx(ctx, func(q *generated.Queries) error {
+		updatedConversation, err := q.UpdateConversationSlug(ctx, generated.UpdateConversationSlugParams{
+			Slug:           &sanitized,
+			ConversationID: conversationID,
+		})
+		if err != nil {
+			return err
+		}
+		conversation = &updatedConversation
+
+		if _, err := q.GetTopicByConversationID(ctx, conversationID); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil
+			}
+			return err
+		}
+
+		renamedTopic = true
+		_, err = q.UpdateTopicName(ctx, generated.UpdateTopicNameParams{
+			TopicName:      sanitized,
+			ConversationID: conversationID,
+		})
+		return err
+	})
 	if err != nil {
 		s.logger.Error("Failed to rename conversation", "conversationID", conversationID, "error", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
+	}
+	if renamedTopic {
+		s.topicManager.RenameTopic(conversationID, sanitized, conversation)
 	}
 
 	// Notify conversation list subscribers
