@@ -34,6 +34,7 @@ type ConversationManager struct {
 	logger         *slog.Logger
 	toolSetConfig  claudetool.ToolSetConfig
 	toolSet        *claudetool.ToolSet // created per-conversation when loop starts
+	extraTools     []*llm.Tool
 
 	subpub *subpub.SubPub[StreamResponse]
 
@@ -256,6 +257,48 @@ func hasNonSystemMessages(messages []generated.Message) bool {
 	return false
 }
 
+func cloneTools(tools []*llm.Tool) []*llm.Tool {
+	if len(tools) == 0 {
+		return nil
+	}
+	cloned := make([]*llm.Tool, len(tools))
+	copy(cloned, tools)
+	return cloned
+}
+
+func combineTools(localTools, extraTools []*llm.Tool) []*llm.Tool {
+	if len(localTools) == 0 && len(extraTools) == 0 {
+		return nil
+	}
+	combined := make([]*llm.Tool, 0, len(localTools)+len(extraTools))
+	combined = append(combined, localTools...)
+	combined = append(combined, extraTools...)
+	return combined
+}
+
+func (cm *ConversationManager) extraToolsSnapshot() []*llm.Tool {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	return cloneTools(cm.extraTools)
+}
+
+func (cm *ConversationManager) SetExtraTools(extraTools []*llm.Tool) {
+	extraCopy := cloneTools(extraTools)
+
+	cm.mu.Lock()
+	cm.extraTools = extraCopy
+	loopInstance := cm.loop
+	var localTools []*llm.Tool
+	if cm.toolSet != nil {
+		localTools = cloneTools(cm.toolSet.Tools())
+	}
+	cm.mu.Unlock()
+
+	if loopInstance != nil {
+		loopInstance.SetTools(combineTools(localTools, extraCopy))
+	}
+}
+
 func (cm *ConversationManager) createSystemPrompt(ctx context.Context) (*generated.Message, error) {
 	var opts []SystemPromptOption
 	if cm.userEmail != "" {
@@ -281,7 +324,7 @@ func (cm *ConversationManager) createSystemPrompt(ctx context.Context) (*generat
 		Type:           db.MessageTypeSystem,
 		LLMData:        systemMessage,
 		UsageData:      llm.Usage{},
-		DisplayData:    systemPromptDisplayData(cm.toolSetConfig),
+		DisplayData:    systemPromptDisplayData(cm.toolSetConfig, cm.extraToolsSnapshot()),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to store system prompt: %w", err)
@@ -299,7 +342,7 @@ func (cm *ConversationManager) createSystemPrompt(ctx context.Context) (*generat
 
 // systemPromptDisplayData returns display data for system prompt messages,
 // including tool descriptions for the UI.
-func systemPromptDisplayData(cfg claudetool.ToolSetConfig) map[string]any {
+func systemPromptDisplayData(cfg claudetool.ToolSetConfig, extraTools []*llm.Tool) map[string]any {
 	ts := claudetool.NewToolSet(context.Background(), cfg)
 	defer ts.Cleanup()
 
@@ -308,7 +351,7 @@ func systemPromptDisplayData(cfg claudetool.ToolSetConfig) map[string]any {
 		Description string `json:"description"`
 	}
 	var descs []toolDesc
-	for _, t := range ts.Tools() {
+	for _, t := range combineTools(ts.Tools(), extraTools) {
 		descs = append(descs, toolDesc{Name: t.Name, Description: t.Description})
 	}
 	return map[string]any{
@@ -337,7 +380,7 @@ func (cm *ConversationManager) createSubagentSystemPrompt(ctx context.Context) (
 		Type:           db.MessageTypeSystem,
 		LLMData:        systemMessage,
 		UsageData:      llm.Usage{},
-		DisplayData:    systemPromptDisplayData(cm.toolSetConfig),
+		DisplayData:    systemPromptDisplayData(cm.toolSetConfig, cm.extraToolsSnapshot()),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to store subagent system prompt: %w", err)
@@ -414,6 +457,7 @@ func (cm *ConversationManager) ensureLoop(service llm.Service, modelID string) e
 	toolSetConfig := cm.toolSetConfig
 	conversationID := cm.conversationID
 	db := cm.db
+	extraTools := cloneTools(cm.extraTools)
 	cm.mu.Unlock()
 
 	// Load conversation history fresh from the database. This is the canonical
@@ -469,11 +513,12 @@ func (cm *ConversationManager) ensureLoop(service llm.Service, modelID string) e
 	baseCtx := llmhttp.WithConversationID(context.Background(), conversationID)
 	processCtx, cancel := context.WithTimeout(baseCtx, 12*time.Hour)
 	toolSet := claudetool.NewToolSet(processCtx, toolSetConfig)
+	combinedTools := combineTools(toolSet.Tools(), extraTools)
 
 	loopInstance := loop.NewLoop(loop.Config{
 		LLM:           service,
 		History:       history,
-		Tools:         toolSet.Tools(),
+		Tools:         combinedTools,
 		RecordMessage: recordMessage,
 		Logger:        logger,
 		System:        system,

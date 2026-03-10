@@ -6,6 +6,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
+
+	"shelley.exe.dev/llm"
 )
 
 func TestWorkspaceToolsLifecycle(t *testing.T) {
@@ -187,4 +190,229 @@ func TestWorkspaceToolsRejectDuplicateName(t *testing.T) {
 			t.Fatalf("expected second duplicate create to conflict, got %d", resp.StatusCode)
 		}
 	}
+}
+
+func TestWorkspaceToolsRefreshActiveTopicTurns(t *testing.T) {
+	server, _, predictable := newTestServer(t)
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	sessionID := createWorkspaceTopic(t, httpServer.URL, "tool-refresh")
+
+	sendTopicAPIChat(t, httpServer.URL, sessionID, "echo: before grant")
+	waitFor(t, 2*time.Second, func() bool {
+		return predictable.GetLastRequest() != nil
+	})
+	if names := requestToolNames(predictable.GetLastRequest()); containsString(names, "workspace_github") {
+		t.Fatalf("expected workspace tool to stay hidden before grants, got %#v", names)
+	}
+
+	createWorkspaceTool(t, httpServer.URL, `{
+		"name":"github",
+		"description":"GitHub access",
+		"actions":["read","write"]
+	}`)
+	createWorkspaceGrant(t, httpServer.URL, "github", `{
+		"subject":"agent:*",
+		"actions":["read"],
+		"access":"allowed"
+	}`)
+
+	predictable.ClearRequests()
+	sendTopicAPIChat(t, httpServer.URL, sessionID, "echo: after grant")
+	waitFor(t, 2*time.Second, func() bool {
+		return predictable.GetLastRequest() != nil
+	})
+	if names := requestToolNames(predictable.GetLastRequest()); !containsString(names, "workspace_github") {
+		t.Fatalf("expected granted workspace tool in request, got %#v", names)
+	}
+
+	deleteReq, err := http.NewRequest(http.MethodDelete, httpServer.URL+"/ws/tools/github", nil)
+	if err != nil {
+		t.Fatalf("failed to build workspace tool delete request: %v", err)
+	}
+	deleteResp, err := http.DefaultClient.Do(deleteReq)
+	if err != nil {
+		t.Fatalf("failed to delete workspace tool: %v", err)
+	}
+	defer deleteResp.Body.Close()
+	if deleteResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 from workspace tool delete, got %d", deleteResp.StatusCode)
+	}
+
+	predictable.ClearRequests()
+	sendTopicAPIChat(t, httpServer.URL, sessionID, "echo: after delete")
+	waitFor(t, 2*time.Second, func() bool {
+		return predictable.GetLastRequest() != nil
+	})
+	if names := requestToolNames(predictable.GetLastRequest()); containsString(names, "workspace_github") {
+		t.Fatalf("expected deleted workspace tool to disappear from request, got %#v", names)
+	}
+}
+
+func TestWorkspaceToolsScopeGrantsToMatchingTopic(t *testing.T) {
+	server, _, predictable := newTestServer(t)
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	alphaSessionID := createWorkspaceTopic(t, httpServer.URL, "alpha")
+	betaSessionID := createWorkspaceTopic(t, httpServer.URL, "beta")
+
+	createWorkspaceTool(t, httpServer.URL, `{
+		"name":"gmail",
+		"description":"Gmail access",
+		"actions":["read","send"]
+	}`)
+	createWorkspaceGrant(t, httpServer.URL, "gmail", `{
+		"subject":"agent:alpha",
+		"actions":["read"],
+		"access":"allowed"
+	}`)
+
+	predictable.ClearRequests()
+	sendTopicAPIChat(t, httpServer.URL, alphaSessionID, "echo: alpha")
+	waitFor(t, 2*time.Second, func() bool {
+		return predictable.GetLastRequest() != nil
+	})
+	if names := requestToolNames(predictable.GetLastRequest()); !containsString(names, "workspace_gmail") {
+		t.Fatalf("expected topic-scoped workspace tool for alpha, got %#v", names)
+	}
+
+	predictable.ClearRequests()
+	sendTopicAPIChat(t, httpServer.URL, betaSessionID, "echo: beta")
+	waitFor(t, 2*time.Second, func() bool {
+		return predictable.GetLastRequest() != nil
+	})
+	if names := requestToolNames(predictable.GetLastRequest()); containsString(names, "workspace_gmail") {
+		t.Fatalf("expected topic-scoped workspace tool to stay hidden from beta, got %#v", names)
+	}
+}
+
+func TestWorkspaceToolsRejectInvalidGrantAccess(t *testing.T) {
+	server, _, _ := newTestServer(t)
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	createWorkspaceTool(t, httpServer.URL, `{
+		"name":"calendar",
+		"actions":["read"]
+	}`)
+
+	req, err := http.NewRequest(http.MethodPost, httpServer.URL+"/ws/tools/calendar/grants", bytes.NewBufferString(`{
+		"subject":"agent:*",
+		"actions":["read"],
+		"access":"sometimes"
+	}`))
+	if err != nil {
+		t.Fatalf("failed to build invalid grant request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("failed to send invalid grant request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 from invalid grant access, got %d", resp.StatusCode)
+	}
+}
+
+func createWorkspaceTopic(t *testing.T, baseURL, topicName string) string {
+	t.Helper()
+
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/topics", bytes.NewBufferString(`{"name":"`+topicName+`"}`))
+	if err != nil {
+		t.Fatalf("failed to build topic create request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("failed to create workspace topic: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 from topic create, got %d", resp.StatusCode)
+	}
+
+	var created workspaceTopicInfo
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+		t.Fatalf("failed to decode topic create response: %v", err)
+	}
+	return created.SessionID
+}
+
+func createWorkspaceTool(t *testing.T, baseURL, rawJSON string) {
+	t.Helper()
+
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/ws/tools", bytes.NewBufferString(rawJSON))
+	if err != nil {
+		t.Fatalf("failed to build workspace tool create request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("failed to create workspace tool: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 from workspace tool create, got %d", resp.StatusCode)
+	}
+}
+
+func createWorkspaceGrant(t *testing.T, baseURL, toolName, rawJSON string) {
+	t.Helper()
+
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/ws/tools/"+toolName+"/grants", bytes.NewBufferString(rawJSON))
+	if err != nil {
+		t.Fatalf("failed to build workspace grant create request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("failed to create workspace grant: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 from workspace grant create, got %d", resp.StatusCode)
+	}
+}
+
+func sendTopicAPIChat(t *testing.T, baseURL, sessionID, message string) {
+	t.Helper()
+
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/api/conversation/"+sessionID+"/chat", bytes.NewBufferString(`{"message":"`+message+`","model":"predictable"}`))
+	if err != nil {
+		t.Fatalf("failed to build topic api chat request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("failed to send topic api chat request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("expected 202 from topic api chat, got %d", resp.StatusCode)
+	}
+}
+
+func requestToolNames(req *llm.Request) []string {
+	if req == nil {
+		return nil
+	}
+	names := make([]string, 0, len(req.Tools))
+	for _, tool := range req.Tools {
+		names = append(names, tool.Name)
+	}
+	return names
 }

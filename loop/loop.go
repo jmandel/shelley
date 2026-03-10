@@ -118,6 +118,13 @@ func (l *Loop) GetHistory() []llm.Message {
 	return historyCopy
 }
 
+// SetTools replaces the available tool list for subsequent turns.
+func (l *Loop) SetTools(tools []*llm.Tool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.tools = tools
+}
+
 // Go runs the conversation loop until the context is canceled
 func (l *Loop) Go(ctx context.Context) error {
 	if l.llm == nil {

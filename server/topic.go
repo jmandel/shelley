@@ -232,8 +232,14 @@ func (t *Topic) drainPrompts() {
 			return
 		}
 
-		t.WSHub.Broadcast(workspaceWSMessage{Type: "system", Data: "thinking..."})
 		waitCh := t.beginTurn()
+		if err := t.refreshWorkspaceTools(t.runtimeCtx); err != nil {
+			t.abortTurn()
+			t.WSHub.Broadcast(workspaceWSMessage{Type: "error", Data: err.Error()})
+			continue
+		}
+
+		t.WSHub.Broadcast(workspaceWSMessage{Type: "system", Data: "thinking..."})
 
 		modelID := conversationModelID(*t.Conversation, t.Config.ModelID)
 		llmService, err := t.server.llmManager.GetService(modelID)
@@ -260,6 +266,16 @@ func (t *Topic) drainPrompts() {
 			return
 		}
 	}
+}
+
+func (t *Topic) refreshWorkspaceTools(ctx context.Context) error {
+	workspaceTools, err := t.server.buildTopicWorkspaceTools(ctx, t.Name)
+	if err != nil {
+		t.logger.Error("Failed to refresh workspace tools", "error", err)
+		return err
+	}
+	t.Manager.SetExtraTools(workspaceTools)
+	return nil
 }
 
 func (t *Topic) beginTurn() <-chan struct{} {

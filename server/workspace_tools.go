@@ -240,6 +240,23 @@ func (s *Server) handleWorkspaceToolGrants(w http.ResponseWriter, r *http.Reques
 	if req.Access == "" {
 		req.Access = "allowed"
 	}
+	if !isValidWorkspaceGrantAccess(req.Access) {
+		http.Error(w, "invalid access", http.StatusBadRequest)
+		return
+	}
+
+	toolActions, err := decodeJSONStringSlice(tool.Actions)
+	if err != nil {
+		s.logger.Error("Failed to decode workspace tool actions", "tool", toolName, "error", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+	for _, action := range req.Actions {
+		if !containsString(toolActions, action) {
+			http.Error(w, "unknown action for tool", http.StatusBadRequest)
+			return
+		}
+	}
 
 	actionsJSON, err := json.Marshal(req.Actions)
 	if err != nil {
