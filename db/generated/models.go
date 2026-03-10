@@ -89,3 +89,26 @@ type Topic struct {
 	ConversationID string    `json:"conversation_id"`
 	CreatedAt      time.Time `json:"created_at"`
 }
+
+type WorkspaceGrant struct {
+	GrantID   string    `json:"grant_id"`
+	ToolID    string    `json:"tool_id"`
+	Subject   string    `json:"subject"`
+	Actions   string    `json:"actions"`
+	Access    string    `json:"access"`
+	Approvers *string   `json:"approvers"`
+	Scope     *string   `json:"scope"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type WorkspaceTool struct {
+	ToolID        string    `json:"tool_id"`
+	Name          string    `json:"name"`
+	Description   *string   `json:"description"`
+	Protocol      string    `json:"protocol"`
+	Actions       string    `json:"actions"`
+	Provider      *string   `json:"provider"`
+	CredentialRef *string   `json:"credential_ref"`
+	Config        *string   `json:"config"`
+	CreatedAt     time.Time `json:"created_at"`
+}
