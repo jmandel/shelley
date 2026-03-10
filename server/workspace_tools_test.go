@@ -537,7 +537,15 @@ func createWorkspaceGrant(t *testing.T, baseURL, toolName, rawJSON string) {
 func sendTopicAPIChat(t *testing.T, baseURL, sessionID, message string) {
 	t.Helper()
 
-	req, err := http.NewRequest(http.MethodPost, baseURL+"/api/conversation/"+sessionID+"/chat", bytes.NewBufferString(`{"message":"`+message+`","model":"predictable"}`))
+	body, err := json.Marshal(map[string]string{
+		"message": message,
+		"model":   "predictable",
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal topic api chat request: %v", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/api/conversation/"+sessionID+"/chat", bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("failed to build topic api chat request: %v", err)
 	}

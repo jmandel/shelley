@@ -2,13 +2,17 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"shelley.exe.dev/db"
+	"shelley.exe.dev/db/generated"
 	"shelley.exe.dev/llm"
 )
 
@@ -149,6 +153,49 @@ func TestWorkspaceToolMCPRejectsNonObjectInput(t *testing.T) {
 	}
 }
 
+func TestWorkspaceToolMCPStreamableHTTPEndToEndTopicTurn(t *testing.T) {
+	server, database, _ := newTestServer(t)
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	mcpServer := newWorkspaceMCPTestServer(func(args map[string]any) (*mcp.CallToolResult, any, error) {
+		name, _ := args["name"].(string)
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.TextContent{Text: "Hi " + name},
+			},
+		}, nil, nil
+	})
+	transportServer := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
+		return mcpServer
+	}, &mcp.StreamableHTTPOptions{DisableLocalhostProtection: true}))
+	defer transportServer.Close()
+
+	sessionID := createWorkspaceTopic(t, httpServer.URL, "mcp-e2e")
+	createWorkspaceTool(t, httpServer.URL, `{
+		"name":"http-greeter",
+		"actions":["greet"],
+		"config":{
+			"transport":"streamable_http",
+			"endpoint":"`+transportServer.URL+`",
+			"disableStandaloneSSE":true
+		}
+	}`)
+	createWorkspaceGrant(t, httpServer.URL, "http-greeter", `{
+		"subject":"agent:*",
+		"actions":["greet"],
+		"access":"allowed"
+	}`)
+
+	sendTopicAPIChat(t, httpServer.URL, sessionID, `workspace_tool_json: http-greeter greet {"name":"Shelley"}`)
+
+	waitFor(t, 2*time.Second, func() bool {
+		return topicHasToolResultText(t, database, sessionID, "Hi Shelley")
+	})
+}
+
 func newWorkspaceMCPTestServer(handler func(args map[string]any) (*mcp.CallToolResult, any, error)) *mcp.Server {
 	server := mcp.NewServer(&mcp.Implementation{Name: "workspace-test", Version: "v0.0.1"}, nil)
 	mcp.AddTool(server, &mcp.Tool{Name: "greet"}, func(ctx context.Context, req *mcp.CallToolRequest, args map[string]any) (*mcp.CallToolResult, any, error) {
@@ -171,4 +218,40 @@ func workspaceRuntimeTool(t *testing.T, server *Server, topicName, toolName stri
 	}
 	t.Fatalf("workspace runtime tool %q not found in %#v", toolName, requestToolNames(&llm.Request{Tools: tools}))
 	return nil
+}
+
+func topicHasToolResultText(t *testing.T, database *db.DB, conversationID, want string) bool {
+	t.Helper()
+
+	var messages []generated.Message
+	err := database.Queries(context.Background(), func(q *generated.Queries) error {
+		var qerr error
+		messages, qerr = q.ListMessages(context.Background(), conversationID)
+		return qerr
+	})
+	if err != nil {
+		t.Fatalf("failed to list topic messages: %v", err)
+	}
+
+	for _, msg := range messages {
+		if msg.Type != string(db.MessageTypeUser) || msg.LlmData == nil {
+			continue
+		}
+
+		var llmMsg llm.Message
+		if err := json.Unmarshal([]byte(*msg.LlmData), &llmMsg); err != nil {
+			continue
+		}
+		for _, content := range llmMsg.Content {
+			if content.Type != llm.ContentTypeToolResult {
+				continue
+			}
+			for _, result := range content.ToolResult {
+				if result.Type == llm.ContentTypeText && result.Text == want {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }

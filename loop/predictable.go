@@ -200,7 +200,19 @@ func (s *PredictableService) Do(ctx context.Context, req *llm.Request) (*llm.Res
 		if strings.HasPrefix(inputText, "workspace_tool: ") {
 			parts := strings.SplitN(strings.TrimPrefix(inputText, "workspace_tool: "), " ", 2)
 			if len(parts) == 2 && s.requestHasTool(req, "workspace_"+parts[0]) {
-				return s.makeWorkspaceToolResponse(parts[0], parts[1], inputTokens), nil
+				return s.makeWorkspaceToolResponse(parts[0], parts[1], nil, inputTokens), nil
+			}
+			return s.makeResponse("workspace tool unavailable", inputTokens), nil
+		}
+
+		if strings.HasPrefix(inputText, "workspace_tool_json: ") {
+			parts := strings.SplitN(strings.TrimPrefix(inputText, "workspace_tool_json: "), " ", 3)
+			if len(parts) == 3 && s.requestHasTool(req, "workspace_"+parts[0]) {
+				input := json.RawMessage(parts[2])
+				if !json.Valid(input) {
+					return s.makeResponse("invalid workspace tool input json", inputTokens), nil
+				}
+				return s.makeWorkspaceToolResponse(parts[0], parts[1], input, inputTokens), nil
 			}
 			return s.makeResponse("workspace tool unavailable", inputTokens), nil
 		}
@@ -597,8 +609,12 @@ func (s *PredictableService) makeChangeDirToolResponse(path string, inputTokens 
 	}
 }
 
-func (s *PredictableService) makeWorkspaceToolResponse(toolName, action string, inputTokens uint64) *llm.Response {
-	toolInputBytes, _ := json.Marshal(map[string]string{"action": action})
+func (s *PredictableService) makeWorkspaceToolResponse(toolName, action string, input json.RawMessage, inputTokens uint64) *llm.Response {
+	toolInputData := map[string]any{"action": action}
+	if len(input) > 0 {
+		toolInputData["input"] = input
+	}
+	toolInputBytes, _ := json.Marshal(toolInputData)
 	toolInput := json.RawMessage(toolInputBytes)
 	responseText := fmt.Sprintf("I'll use workspace_%s for %s.", toolName, action)
 	outputTokens := uint64(len(responseText)/4 + len(toolInputBytes)/4)
