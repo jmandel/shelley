@@ -323,7 +323,7 @@ func TestPredictableServiceWSHelp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ws help failed: %v", err)
 	}
-	if got := resp.Content[0].Text; !strings.Contains(got, "Primary actions:") || !strings.Contains(got, "toolpause3") {
+	if got := resp.Content[0].Text; !strings.Contains(got, "Primary actions:") || !strings.Contains(got, "toolpause3") || !strings.Contains(got, "Whole demo commands:") || !strings.Contains(got, "Validation now passes the slicing step.") {
 		t.Fatalf("unexpected ws help response %q", got)
 	}
 }

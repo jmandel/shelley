@@ -81,6 +81,30 @@ Examples:
 - ws validator "input/fsh/BloodPressurePanel.fsh" toolpause3 aftertext "Validator finished."
 - ws tool hl7-jira action jira.search input '{"query":"validator warning blood pressure slicing"}'
 
+Whole demo commands:
+1. Validator run that stays busy long enough to show queueing
+   ws validator "input/fsh/BloodPressurePanel.fsh" toolpause5 aftertext "The validator is pointing at missing slicing metadata on Observation.component."
+2. A late-joining participant asks for related Jira issues
+   ws jira "Observation.component slicing validator failure" pause1
+3. Inspect the broken profile from bash
+   ws bash "sed -n '1,200p' input/fsh/BloodPressurePanel.fsh"
+4. Simulate making the slicing fix from bash
+   ws bash "python - <<'PY'
+from pathlib import Path
+path = Path('input/fsh/BloodPressurePanel.fsh')
+text = path.read_text()
+needle = '* component contains\n'
+insert = '* component ^slicing.discriminator[0].type = #pattern\n* component ^slicing.discriminator[0].path = \"code\"\n* component ^slicing.rules = #open\n'
+if insert not in text:
+    text = text.replace(needle, insert + needle, 1)
+path.write_text(text)
+print('Inserted slicing metadata.')
+PY"
+5. Re-run validation after the fix
+   ws validator "input/fsh/BloodPressurePanel.fsh" aftertext "Validation now passes the slicing step."
+6. Short narration or handoff text
+   ws text "Marco, can you review the updated profile before we publish the preview?"
+
 Rules:
 - tags can appear in any order
 - use exactly one primary action
