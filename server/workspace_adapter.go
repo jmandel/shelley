@@ -797,7 +797,37 @@ func translateWorkspaceWSMessagesForAPIMessage(toolTitles map[string]string, msg
 			messages = append(messages, workspaceWSMessage{Type: "done"})
 			return messages, true
 		}
-	case string(dbpkg.MessageTypeUser), string(dbpkg.MessageTypeTool):
+	case string(dbpkg.MessageTypeUser):
+		for _, content := range llmMsg.Content {
+			switch content.Type {
+			case llm.ContentTypeText:
+				if content.Text != "" {
+					messages = append(messages, workspaceWSMessage{Type: "user", Data: content.Text})
+				}
+			case llm.ContentTypeToolResult:
+				status := "completed"
+				if content.ToolError {
+					status = "failed"
+				}
+				title := toolTitles[content.ToolUseID]
+				if title == "" {
+					title = content.ToolUseID
+				}
+				messages = append(messages, workspaceWSMessage{
+					Type:       "tool_update",
+					ToolCallID: content.ToolUseID,
+					Title:      title,
+					Status:     status,
+				})
+				if toolText := llmToolResultText(content.ToolResult); toolText != "" {
+					messages = append(messages, workspaceWSMessage{
+						Type: "text",
+						Data: toolText,
+					})
+				}
+			}
+		}
+	case string(dbpkg.MessageTypeTool):
 		for _, content := range llmMsg.Content {
 			if content.Type != llm.ContentTypeToolResult {
 				continue

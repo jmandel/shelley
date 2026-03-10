@@ -595,10 +595,15 @@ func TestWorkspaceTopicAPIChatUsesTopicQueue(t *testing.T) {
 	var (
 		doneSeen bool
 		textSeen bool
+		userSeen bool
 	)
 	for !doneSeen {
 		msg := readWorkspaceWSMessage(t, ctx, conn)
 		switch msg.Type {
+		case "user":
+			if msg.Data == "echo: from api" {
+				userSeen = true
+			}
 		case "text":
 			textSeen = true
 		case "done":
@@ -606,6 +611,9 @@ func TestWorkspaceTopicAPIChatUsesTopicQueue(t *testing.T) {
 		}
 	}
 
+	if !userSeen {
+		t.Fatal("expected websocket client to receive user prompt from api chat")
+	}
 	if !textSeen {
 		t.Fatal("expected websocket client to receive text output from api chat")
 	}
@@ -632,6 +640,70 @@ func TestWorkspaceTopicAPIChatUsesTopicQueue(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected api chat prompt in predictable request, got %#v", lastRequest.Messages)
+	}
+}
+
+func TestWorkspaceTopicWSReplaysUserMessagesOnConnect(t *testing.T) {
+	server, _, _ := newTestServer(t)
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	createReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/ws/topics", bytes.NewBufferString(`{"name":"user-replay"}`))
+	if err != nil {
+		t.Fatalf("failed to build create request: %v", err)
+	}
+	createReq.Header.Set("Content-Type", "application/json")
+
+	createResp, err := http.DefaultClient.Do(createReq)
+	if err != nil {
+		t.Fatalf("failed to create topic: %v", err)
+	}
+	defer createResp.Body.Close()
+	if createResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 from create, got %d", createResp.StatusCode)
+	}
+
+	var created workspaceTopicInfo
+	if err := json.NewDecoder(createResp.Body).Decode(&created); err != nil {
+		t.Fatalf("failed to decode create response: %v", err)
+	}
+
+	chatReqBody := bytes.NewBufferString(`{"message":"echo: replay me","model":"predictable"}`)
+	chatReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/api/conversation/"+created.SessionID+"/chat", chatReqBody)
+	if err != nil {
+		t.Fatalf("failed to build chat request: %v", err)
+	}
+	chatReq.Header.Set("Content-Type", "application/json")
+
+	chatResp, err := http.DefaultClient.Do(chatReq)
+	if err != nil {
+		t.Fatalf("failed to post api chat: %v", err)
+	}
+	defer chatResp.Body.Close()
+	if chatResp.StatusCode != http.StatusAccepted {
+		t.Fatalf("expected 202 from api chat, got %d", chatResp.StatusCode)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws/topic/user-replay"
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("failed to dial websocket: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "test complete")
+
+	waitForConnectedMessage(t, ctx, conn)
+
+	var replayedUser bool
+	for !replayedUser {
+		msg := readWorkspaceWSMessage(t, ctx, conn)
+		if msg.Type == "user" && msg.Data == "echo: replay me" {
+			replayedUser = true
+		}
 	}
 }
 
