@@ -235,6 +235,7 @@ type Server struct {
 	shutdownCh          chan struct{} // Signals background routines to stop
 	listenPort          int           // TCP port the server is listening on
 	workspaceName       string
+	workspaceRoot       string
 	startedAt           time.Time
 }
 
@@ -255,6 +256,7 @@ func NewServer(database *db.DB, llmManager LLMProvider, toolSetConfig claudetool
 		notifDispatcher:     notifications.NewDispatcher(logger),
 		shutdownCh:          make(chan struct{}),
 		workspaceName:       defaultWorkspaceName(),
+		workspaceRoot:       defaultWorkspaceRoot(),
 		startedAt:           time.Now(),
 	}
 
@@ -287,6 +289,11 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.Handle("POST /ws/topics", http.HandlerFunc(s.handleWorkspaceTopics))
 	mux.Handle("GET /ws/topics/{name}", http.HandlerFunc(s.handleWorkspaceTopic))
 	mux.Handle("DELETE /ws/topics/{name}", http.HandlerFunc(s.handleWorkspaceTopic))
+	mux.Handle("GET /ws/files", http.HandlerFunc(s.handleWorkspaceFile))
+	mux.Handle("GET /ws/files/{$}", http.HandlerFunc(s.handleWorkspaceFile))
+	mux.Handle("GET /ws/files/{path...}", http.HandlerFunc(s.handleWorkspaceFile))
+	mux.Handle("PUT /ws/files/{path...}", http.HandlerFunc(s.handleWorkspaceFile))
+	mux.Handle("DELETE /ws/files/{path...}", http.HandlerFunc(s.handleWorkspaceFile))
 	mux.Handle("GET /ws/topic/{name}", http.HandlerFunc(s.handleWorkspaceTopicWSByName))
 	mux.Handle("GET /ws/acp", http.HandlerFunc(s.handleWorkspaceTopicQueryWS))
 	mux.Handle("GET /ws/acp/{topic}", http.HandlerFunc(s.handleWorkspaceTopicWS))
