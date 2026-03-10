@@ -118,7 +118,11 @@ func decodeWorkspaceMCPConfig(toolRecord generated.WorkspaceTool) (workspaceMCPC
 func (s *Server) newWorkspaceMCPTransport(ctx context.Context, cfg workspaceMCPConfig) (mcp.Transport, error) {
 	switch cfg.Transport {
 	case "stdio":
-		cmd := exec.CommandContext(ctx, cfg.Command, cfg.Args...)
+		commandPath, err := s.resolveWorkspaceMCPCommand(cfg.Command)
+		if err != nil {
+			return nil, err
+		}
+		cmd := exec.CommandContext(ctx, commandPath, cfg.Args...)
 		if cwd, err := s.workspaceMCPCwd(cfg.Cwd); err != nil {
 			return nil, err
 		} else if cwd != "" {
@@ -149,6 +153,29 @@ func (s *Server) newWorkspaceMCPTransport(ctx context.Context, cfg workspaceMCPC
 	default:
 		return nil, fmt.Errorf("unsupported mcp transport %q", cfg.Transport)
 	}
+}
+
+func (s *Server) resolveWorkspaceMCPCommand(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", fmt.Errorf("missing mcp stdio command")
+	}
+	if filepath.IsAbs(raw) || strings.ContainsRune(raw, filepath.Separator) {
+		return raw, nil
+	}
+
+	if toolsDir := strings.TrimSpace(os.Getenv("WORKSPACE_TOOLS_DIR")); toolsDir != "" {
+		candidate := filepath.Join(toolsDir, "bin", raw)
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate, nil
+		}
+	}
+
+	resolved, err := exec.LookPath(raw)
+	if err != nil {
+		return "", fmt.Errorf("resolve mcp stdio command %q: %w", raw, err)
+	}
+	return resolved, nil
 }
 
 func (s *Server) workspaceMCPCwd(raw string) (string, error) {

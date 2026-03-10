@@ -3,9 +3,11 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -68,6 +70,47 @@ func TestWorkspaceToolMCPStdioExecutesTextTool(t *testing.T) {
 	result := tool.Run(context.Background(), []byte(`{"action":"greet","input":{"name":"Shelley"}}`))
 	if result.Error != nil {
 		t.Fatalf("expected stdio mcp tool to succeed, got %v", result.Error)
+	}
+	if len(result.LLMContent) != 1 || result.LLMContent[0].Text != "Hello Shelley" {
+		t.Fatalf("unexpected stdio mcp tool output: %#v", result.LLMContent)
+	}
+}
+
+func TestWorkspaceToolMCPStdioResolvesCommandFromWorkspaceToolsDir(t *testing.T) {
+	server, _, _ := newTestServer(t)
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	toolsDir := t.TempDir()
+	binDir := filepath.Join(toolsDir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("failed to create tools bin dir: %v", err)
+	}
+	helperPath := filepath.Join(binDir, "workspace-mcp-helper")
+	copyExecutable(t, os.Args[0], helperPath)
+	t.Setenv("WORKSPACE_TOOLS_DIR", toolsDir)
+
+	createWorkspaceTool(t, httpServer.URL, `{
+		"name":"greeter",
+		"actions":["greet"],
+		"config":{
+			"transport":"stdio",
+			"command":"workspace-mcp-helper",
+			"env":{"`+workspaceMCPStdioHelperEnv+`":"1"}
+		}
+	}`)
+	createWorkspaceGrant(t, httpServer.URL, "greeter", `{
+		"subject":"agent:*",
+		"actions":["greet"],
+		"access":"allowed"
+	}`)
+
+	tool := workspaceRuntimeTool(t, server, "alpha", "workspace_greeter")
+	result := tool.Run(context.Background(), []byte(`{"action":"greet","input":{"name":"Shelley"}}`))
+	if result.Error != nil {
+		t.Fatalf("expected stdio mcp tool from workspace tools dir to succeed, got %v", result.Error)
 	}
 	if len(result.LLMContent) != 1 || result.LLMContent[0].Text != "Hello Shelley" {
 		t.Fatalf("unexpected stdio mcp tool output: %#v", result.LLMContent)
@@ -364,4 +407,27 @@ func topicHasToolResultText(t *testing.T, database *db.DB, conversationID, want 
 		}
 	}
 	return false
+}
+
+func copyExecutable(t *testing.T, src, dst string) {
+	t.Helper()
+
+	in, err := os.Open(src)
+	if err != nil {
+		t.Fatalf("failed to open source executable: %v", err)
+	}
+	defer in.Close()
+
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
+	if err != nil {
+		t.Fatalf("failed to create destination executable: %v", err)
+	}
+	defer out.Close()
+
+	if _, err := io.Copy(out, in); err != nil {
+		t.Fatalf("failed to copy executable: %v", err)
+	}
+	if err := out.Close(); err != nil {
+		t.Fatalf("failed to close destination executable: %v", err)
+	}
 }
