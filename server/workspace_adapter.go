@@ -106,7 +106,6 @@ type workspaceQueueClearResponse struct {
 
 type workspaceQueueUpdateRequest struct {
 	Data string `json:"data"`
-	Text string `json:"text"`
 }
 
 type workspaceQueueMoveRequest struct {
@@ -592,9 +591,6 @@ func (s *Server) handleWorkspaceTopicQueueEntry(w http.ResponseWriter, r *http.R
 			return
 		}
 		text := strings.TrimSpace(req.Data)
-		if text == "" {
-			text = strings.TrimSpace(req.Text)
-		}
 		if text == "" {
 			http.Error(w, "data is required", http.StatusBadRequest)
 			return
