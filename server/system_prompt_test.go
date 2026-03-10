@@ -44,6 +44,35 @@ func TestSystemPromptIncludesCwdGuidanceFiles(t *testing.T) {
 	}
 }
 
+func TestSystemPromptIncludesShelleySubdirGuidanceFiles(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "shelley_subdir_test")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".shelley"), 0o755); err != nil {
+		t.Fatalf("failed to create .shelley dir: %v", err)
+	}
+	agentsContent := "SHELLEY_SUBDIR_GUIDANCE_98765: Use the mounted local validator command."
+	agentsFile := filepath.Join(tmpDir, ".shelley", "AGENTS.md")
+	if err := os.WriteFile(agentsFile, []byte(agentsContent), 0o644); err != nil {
+		t.Fatalf("failed to write .shelley/AGENTS.md: %v", err)
+	}
+
+	prompt, err := GenerateSystemPrompt(tmpDir)
+	if err != nil {
+		t.Fatalf("GenerateSystemPrompt failed: %v", err)
+	}
+
+	if !strings.Contains(prompt, "SHELLEY_SUBDIR_GUIDANCE_98765") {
+		t.Errorf("system prompt should contain content from .shelley/AGENTS.md")
+	}
+	if !strings.Contains(prompt, agentsFile) {
+		t.Errorf("system prompt should reference .shelley/AGENTS.md file path")
+	}
+}
+
 // TestSystemPromptEmptyCwdFallsBackToCurrentDir verifies that an empty workingDir
 // causes GenerateSystemPrompt to use the current directory.
 func TestSystemPromptEmptyCwdFallsBackToCurrentDir(t *testing.T) {

@@ -197,6 +197,96 @@ func TestWorkspaceToolsRejectDuplicateName(t *testing.T) {
 	}
 }
 
+func TestWorkspaceToolsAcceptRFCPayloadShape(t *testing.T) {
+	server, _, _ := newTestServer(t)
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	createReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/ws/tools", bytes.NewBufferString(`{
+		"name":"hl7-jira",
+		"description":"Search realistic HL7 Jira fixture data",
+		"provider":"demo@acme.example",
+		"protocol":"mcp",
+		"transport":{
+			"type":"stdio",
+			"command":"bun",
+			"args":["./.demo/hl7-jira-mcp.js"],
+			"cwd":"."
+		},
+		"tools":[
+			{
+				"name":"jira.search",
+				"title":"Search HL7 Jira",
+				"description":"Search fixture issues related to validation behavior",
+				"inputSchema":{
+					"type":"object",
+					"properties":{"query":{"type":"string"}},
+					"required":["query"],
+					"additionalProperties":false
+				}
+			}
+		]
+	}`))
+	if err != nil {
+		t.Fatalf("failed to build RFC-shaped tool create request: %v", err)
+	}
+	createReq.Header.Set("Content-Type", "application/json")
+
+	createResp, err := http.DefaultClient.Do(createReq)
+	if err != nil {
+		t.Fatalf("failed to create RFC-shaped workspace tool: %v", err)
+	}
+	defer createResp.Body.Close()
+	if createResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 from RFC-shaped tool create, got %d", createResp.StatusCode)
+	}
+
+	var created workspaceToolInfo
+	if err := json.NewDecoder(createResp.Body).Decode(&created); err != nil {
+		t.Fatalf("failed to decode RFC-shaped tool create response: %v", err)
+	}
+	if created.Name != "hl7-jira" || len(created.Tools) != 1 || created.Tools[0].Name != "jira.search" {
+		t.Fatalf("unexpected RFC-shaped created tool: %#v", created)
+	}
+	if !json.Valid(created.Transport) || !strings.Contains(string(created.Transport), `"type":"stdio"`) {
+		t.Fatalf("expected canonical transport in response, got %s", string(created.Transport))
+	}
+
+	grantReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/ws/tools/hl7-jira/grants", bytes.NewBufferString(`{
+		"subject":"agent:*",
+		"tools":["jira.search"],
+		"access":"allowed"
+	}`))
+	if err != nil {
+		t.Fatalf("failed to build RFC-shaped grant request: %v", err)
+	}
+	grantReq.Header.Set("Content-Type", "application/json")
+
+	grantResp, err := http.DefaultClient.Do(grantReq)
+	if err != nil {
+		t.Fatalf("failed to create RFC-shaped grant: %v", err)
+	}
+	defer grantResp.Body.Close()
+	if grantResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 from RFC-shaped grant create, got %d", grantResp.StatusCode)
+	}
+
+	var grant workspaceGrantInfo
+	if err := json.NewDecoder(grantResp.Body).Decode(&grant); err != nil {
+		t.Fatalf("failed to decode RFC-shaped grant response: %v", err)
+	}
+	if len(grant.Tools) != 1 || grant.Tools[0] != "jira.search" {
+		t.Fatalf("unexpected RFC-shaped grant response: %#v", grant)
+	}
+
+	fetched := getWorkspaceToolInfo(t, httpServer.URL, "hl7-jira")
+	if len(fetched.Grants) != 1 || len(fetched.Grants[0].Tools) != 1 || fetched.Grants[0].Tools[0] != "jira.search" {
+		t.Fatalf("unexpected fetched RFC-shaped tool grants: %#v", fetched.Grants)
+	}
+}
+
 func TestWorkspaceToolsStoreActionMetadataAndRuntimeSchema(t *testing.T) {
 	server, _, _ := newTestServer(t)
 	mux := http.NewServeMux()

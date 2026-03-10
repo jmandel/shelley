@@ -18,6 +18,7 @@ type workspaceGrantInfo struct {
 	GrantID   string          `json:"grantId"`
 	Subject   string          `json:"subject"`
 	Actions   []string        `json:"actions"`
+	Tools     []string        `json:"tools"`
 	Access    string          `json:"access"`
 	Approvers []string        `json:"approvers,omitempty"`
 	Scope     json.RawMessage `json:"scope,omitempty"`
@@ -31,6 +32,8 @@ type workspaceToolInfo struct {
 	Protocol      string                 `json:"protocol"`
 	Actions       []string               `json:"actions"`
 	ActionDefs    []workspaceActionInfo  `json:"actionDefs,omitempty"`
+	Transport     json.RawMessage        `json:"transport,omitempty"`
+	Tools         []workspaceActionInfo  `json:"tools,omitempty"`
 	Provider      string                 `json:"provider,omitempty"`
 	CredentialRef string                 `json:"credentialRef,omitempty"`
 	Config        json.RawMessage        `json:"config,omitempty"`
@@ -79,6 +82,8 @@ func (s *Server) handleWorkspaceToolsCreate(w http.ResponseWriter, r *http.Reque
 		Description   string          `json:"description"`
 		Protocol      string          `json:"protocol"`
 		Actions       json.RawMessage `json:"actions"`
+		Tools         json.RawMessage `json:"tools"`
+		Transport     json.RawMessage `json:"transport"`
 		Provider      string          `json:"provider"`
 		CredentialRef string          `json:"credentialRef"`
 		Config        json.RawMessage `json:"config"`
@@ -97,7 +102,11 @@ func (s *Server) handleWorkspaceToolsCreate(w http.ResponseWriter, r *http.Reque
 		req.Protocol = "mcp"
 	}
 
-	actionDefs, err := normalizeWorkspaceActionDefs(req.Actions)
+	toolDefsRaw := req.Tools
+	if len(toolDefsRaw) == 0 {
+		toolDefsRaw = req.Actions
+	}
+	actionDefs, err := normalizeWorkspaceActionDefs(toolDefsRaw)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -118,8 +127,12 @@ func (s *Server) handleWorkspaceToolsCreate(w http.ResponseWriter, r *http.Reque
 	if req.CredentialRef != "" {
 		credentialRefPtr = &req.CredentialRef
 	}
-	if len(req.Config) > 0 {
-		configText := string(req.Config)
+	configPayload := req.Config
+	if len(req.Transport) > 0 {
+		configPayload = req.Transport
+	}
+	if len(configPayload) > 0 {
+		configText := string(configPayload)
 		configPtr = &configText
 	}
 
@@ -235,6 +248,7 @@ func (s *Server) handleWorkspaceToolGrants(w http.ResponseWriter, r *http.Reques
 	var req struct {
 		Subject   string          `json:"subject"`
 		Actions   []string        `json:"actions"`
+		Tools     []string        `json:"tools"`
 		Access    string          `json:"access"`
 		Approvers []string        `json:"approvers"`
 		Scope     json.RawMessage `json:"scope"`
@@ -247,6 +261,9 @@ func (s *Server) handleWorkspaceToolGrants(w http.ResponseWriter, r *http.Reques
 	if req.Subject == "" {
 		http.Error(w, "subject required", http.StatusBadRequest)
 		return
+	}
+	if len(req.Tools) > 0 && len(req.Actions) == 0 {
+		req.Actions = append([]string(nil), req.Tools...)
 	}
 	if len(req.Actions) == 0 {
 		http.Error(w, "actions required", http.StatusBadRequest)
@@ -400,6 +417,7 @@ func (s *Server) workspaceToolInfo(ctx context.Context, tool generated.Workspace
 		Protocol:   tool.Protocol,
 		Actions:    workspaceActionNames(actionDefs),
 		ActionDefs: workspaceActionInfos(actionDefs),
+		Tools:      workspaceActionInfos(actionDefs),
 		CreatedAt:  tool.CreatedAt.Format(time.RFC3339),
 		Grants:     make([]workspaceGrantInfo, 0, len(grants)),
 	}
@@ -417,6 +435,7 @@ func (s *Server) workspaceToolInfo(ctx context.Context, tool generated.Workspace
 	}
 	if tool.Config != nil {
 		info.Config = json.RawMessage(*tool.Config)
+		info.Transport = workspaceTransportFromConfig(*tool.Config)
 	}
 
 	for _, grant := range grants {
@@ -443,6 +462,7 @@ func workspaceGrantInfoFromRecord(grant generated.WorkspaceGrant) (workspaceGran
 		GrantID:   grant.GrantID,
 		Subject:   grant.Subject,
 		Actions:   actions,
+		Tools:     append([]string(nil), actions...),
 		Access:    grant.Access,
 		CreatedAt: grant.CreatedAt.Format(time.RFC3339),
 	}
@@ -485,6 +505,46 @@ func decodeJSONStringSlice(raw string) ([]string, error) {
 		return nil, err
 	}
 	return values, nil
+}
+
+func workspaceTransportFromConfig(raw string) json.RawMessage {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(trimmed), &payload); err != nil {
+		return json.RawMessage(trimmed)
+	}
+	if _, hasType := payload["type"]; hasType {
+		normalized, err := json.Marshal(payload)
+		if err != nil {
+			return json.RawMessage(trimmed)
+		}
+		return normalized
+	}
+
+	transportType, _ := payload["transport"].(string)
+	switch strings.ToLower(strings.TrimSpace(transportType)) {
+	case "stdio":
+		delete(payload, "transport")
+		payload["type"] = "stdio"
+	case "streamable_http", "streamable-http":
+		delete(payload, "transport")
+		payload["type"] = "streamable_http"
+		if urlValue, ok := payload["endpoint"]; ok {
+			payload["url"] = urlValue
+			delete(payload, "endpoint")
+		}
+	default:
+		return json.RawMessage(trimmed)
+	}
+
+	normalized, err := json.Marshal(payload)
+	if err != nil {
+		return json.RawMessage(trimmed)
+	}
+	return normalized
 }
 
 func (s *Server) lookupWorkspaceToolByName(ctx context.Context, name string) (*generated.WorkspaceTool, error) {

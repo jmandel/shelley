@@ -18,11 +18,13 @@ import (
 
 type workspaceMCPConfig struct {
 	Transport            string            `json:"transport"`
+	Type                 string            `json:"type"`
 	Command              string            `json:"command"`
 	Args                 []string          `json:"args"`
 	Env                  map[string]string `json:"env"`
 	Cwd                  string            `json:"cwd"`
 	Endpoint             string            `json:"endpoint"`
+	URL                  string            `json:"url"`
 	Headers              map[string]string `json:"headers"`
 	DisableStandaloneSSE bool              `json:"disableStandaloneSSE"`
 	MaxRetries           *int              `json:"maxRetries,omitempty"`
@@ -99,6 +101,9 @@ func decodeWorkspaceMCPConfig(toolRecord generated.WorkspaceTool) (workspaceMCPC
 	}
 
 	cfg.Transport = strings.ToLower(strings.TrimSpace(cfg.Transport))
+	if cfg.Transport == "" {
+		cfg.Transport = strings.ToLower(strings.TrimSpace(cfg.Type))
+	}
 	switch cfg.Transport {
 	case "stdio":
 		if strings.TrimSpace(cfg.Command) == "" {
@@ -106,6 +111,9 @@ func decodeWorkspaceMCPConfig(toolRecord generated.WorkspaceTool) (workspaceMCPC
 		}
 	case "streamable_http", "streamable-http":
 		cfg.Transport = "streamable_http"
+		if strings.TrimSpace(cfg.Endpoint) == "" {
+			cfg.Endpoint = strings.TrimSpace(cfg.URL)
+		}
 		if strings.TrimSpace(cfg.Endpoint) == "" {
 			return cfg, fmt.Errorf("workspace tool %s streamable_http transport requires endpoint", toolRecord.Name)
 		}

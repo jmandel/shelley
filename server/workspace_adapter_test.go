@@ -421,6 +421,61 @@ func TestWorkspaceTopicWSQueuesPrompt(t *testing.T) {
 	}
 }
 
+func TestWorkspaceTopicWSReplaysRecentMessagesOnConnect(t *testing.T) {
+	server, _, _ := newTestServer(t)
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws/topic/general"
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("failed to dial websocket: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "test complete")
+
+	waitForConnectedMessage(t, ctx, conn)
+	if err := wsjson.Write(ctx, conn, workspacePromptMessage{Type: "prompt", Data: "echo: replay-me"}); err != nil {
+		t.Fatalf("failed to send prompt: %v", err)
+	}
+
+	var doneSeen bool
+	for !doneSeen {
+		msg := readWorkspaceWSMessage(t, ctx, conn)
+		if msg.Type == "done" {
+			doneSeen = true
+		}
+	}
+
+	replayConn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("failed to dial replay websocket: %v", err)
+	}
+	defer replayConn.Close(websocket.StatusNormalClosure, "test complete")
+
+	waitForConnectedMessage(t, ctx, replayConn)
+
+	var (
+		replayedText bool
+		replayedDone bool
+	)
+	for !(replayedText && replayedDone) {
+		msg := readWorkspaceWSMessage(t, ctx, replayConn)
+		switch msg.Type {
+		case "text":
+			if msg.Data == "replay-me" {
+				replayedText = true
+			}
+		case "done":
+			replayedDone = true
+		}
+	}
+}
+
 func TestWorkspaceTopicWSPromptBroadcastsToSSE(t *testing.T) {
 	server, _, _ := newTestServer(t)
 	mux := http.NewServeMux()
@@ -758,7 +813,13 @@ func TestEmitWorkspaceWSMessagesTranslatesToolLifecycle(t *testing.T) {
 	toolRaw, err := json.Marshal(llm.Message{
 		Role: llm.MessageRoleUser,
 		Content: []llm.Content{
-			{Type: llm.ContentTypeToolResult, ToolUseID: "tool-1"},
+			{
+				Type:      llm.ContentTypeToolResult,
+				ToolUseID: "tool-1",
+				ToolResult: []llm.Content{
+					{Type: llm.ContentTypeText, Text: "validator output"},
+				},
+			},
 		},
 	})
 	if err != nil {
@@ -774,12 +835,15 @@ func TestEmitWorkspaceWSMessagesTranslatesToolLifecycle(t *testing.T) {
 		t.Fatal("did not expect tool result to end the turn")
 	}
 
-	if len(messages) != 1 {
-		t.Fatalf("expected one translated tool result message, got %#v", messages)
+	if len(messages) != 2 {
+		t.Fatalf("expected tool status plus text replay, got %#v", messages)
 	}
 	toolUpdate := messages[0]
 	if toolUpdate.Type != "tool_update" || toolUpdate.ToolCallID != "tool-1" || toolUpdate.Title != "bash" || toolUpdate.Status != "completed" {
 		t.Fatalf("unexpected tool_update message: %#v", toolUpdate)
+	}
+	if messages[1].Type != "text" || messages[1].Data != "validator output" {
+		t.Fatalf("unexpected translated tool result text: %#v", messages[1])
 	}
 }
 

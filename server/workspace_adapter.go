@@ -368,6 +368,17 @@ func (s *Server) handleWorkspaceTopicWSForName(w http.ResponseWriter, r *http.Re
 		Topic:     topicName,
 		SessionID: topic.Conversation.ConversationID,
 	})
+	replayMessages, err := s.replayWorkspaceTopicMessages(ctx, topic.Conversation.ConversationID)
+	if err != nil {
+		sendWorkspaceWSMessage(ctx, outCh, workspaceWSMessage{Type: "error", Data: "failed to replay topic history"})
+	} else {
+		for _, replayMsg := range replayMessages {
+			sendWorkspaceWSMessage(ctx, outCh, replayMsg)
+		}
+		if topic.IsBusy() {
+			sendWorkspaceWSMessage(ctx, outCh, workspaceWSMessage{Type: "system", Data: "thinking..."})
+		}
+	}
 
 	for {
 		var msg workspacePromptMessage
@@ -396,6 +407,28 @@ func (s *Server) handleWorkspaceTopicWSForName(w http.ResponseWriter, r *http.Re
 			})
 		}
 	}
+}
+
+func (s *Server) replayWorkspaceTopicMessages(ctx context.Context, conversationID string) ([]workspaceWSMessage, error) {
+	var records []generated.Message
+	if err := s.db.Queries(ctx, func(q *generated.Queries) error {
+		var err error
+		records, err = q.ListMessages(ctx, conversationID)
+		return err
+	}); err != nil {
+		return nil, err
+	}
+
+	toolTitles := make(map[string]string)
+	messages := make([]workspaceWSMessage, 0, len(records))
+	for _, record := range records {
+		translated, _ := translateWorkspaceWSMessagesForAPIMessage(toolTitles, APIMessage{
+			Type:    record.Type,
+			LlmData: record.LlmData,
+		})
+		messages = append(messages, translated...)
+	}
+	return messages, nil
 }
 
 func (s *Server) workspaceTopics(ctx context.Context, r *http.Request) ([]workspaceTopicInfo, error) {
@@ -783,6 +816,12 @@ func translateWorkspaceWSMessagesForAPIMessage(toolTitles map[string]string, msg
 				Title:      title,
 				Status:     status,
 			})
+			if toolText := llmToolResultText(content.ToolResult); toolText != "" {
+				messages = append(messages, workspaceWSMessage{
+					Type: "text",
+					Data: toolText,
+				})
+			}
 		}
 	case string(dbpkg.MessageTypeError):
 		messages = append(messages, workspaceWSMessage{
@@ -806,6 +845,16 @@ func sendWorkspaceWSMessage(ctx context.Context, outCh chan<- workspaceWSMessage
 func llmMessageText(message llm.Message) string {
 	var parts []string
 	for _, content := range message.Content {
+		if content.Type == llm.ContentTypeText && content.Text != "" {
+			parts = append(parts, content.Text)
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
+func llmToolResultText(contents []llm.Content) string {
+	var parts []string
+	for _, content := range contents {
 		if content.Type == llm.ContentTypeText && content.Text != "" {
 			parts = append(parts, content.Text)
 		}

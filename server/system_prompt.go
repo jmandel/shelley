@@ -235,6 +235,23 @@ func collectCodebaseInfo(wd string, gitInfo *GitInfo) (*CodebaseInfo, error) {
 	}
 
 	// Find root-level guidance files (case-insensitive)
+	extraGuidanceFiles := []string{
+		filepath.Join(searchRoot, ".shelley", "AGENTS.md"),
+	}
+	for _, file := range extraGuidanceFiles {
+		lowerPath := strings.ToLower(file)
+		if seenFiles[lowerPath] {
+			continue
+		}
+		content, err := os.ReadFile(file)
+		if err == nil && len(content) > 0 {
+			info.InjectFiles = append(info.InjectFiles, file)
+			info.InjectFileContents[file] = string(content)
+			seenFiles[lowerPath] = true
+		}
+	}
+
+	// Find root-level guidance files (case-insensitive)
 	rootGuidanceFiles := findGuidanceFilesInDir(searchRoot)
 	for _, file := range rootGuidanceFiles {
 		lowerPath := strings.ToLower(file)
@@ -252,6 +269,22 @@ func collectCodebaseInfo(wd string, gitInfo *GitInfo) (*CodebaseInfo, error) {
 
 	// If working directory is different from root, also check working directory
 	if wd != searchRoot {
+		wdExtraGuidanceFiles := []string{
+			filepath.Join(wd, ".shelley", "AGENTS.md"),
+		}
+		for _, file := range wdExtraGuidanceFiles {
+			lowerPath := strings.ToLower(file)
+			if seenFiles[lowerPath] {
+				continue
+			}
+			content, err := os.ReadFile(file)
+			if err == nil && len(content) > 0 {
+				info.InjectFiles = append(info.InjectFiles, file)
+				info.InjectFileContents[file] = string(content)
+				seenFiles[lowerPath] = true
+			}
+		}
+
 		wdGuidanceFiles := findGuidanceFilesInDir(wd)
 		for _, file := range wdGuidanceFiles {
 			lowerPath := strings.ToLower(file)

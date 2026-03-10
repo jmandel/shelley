@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -114,6 +115,72 @@ func TestWorkspaceToolMCPStdioResolvesCommandFromWorkspaceToolsDir(t *testing.T)
 	}
 	if len(result.LLMContent) != 1 || result.LLMContent[0].Text != "Hello Shelley" {
 		t.Fatalf("unexpected stdio mcp tool output: %#v", result.LLMContent)
+	}
+}
+
+func TestWorkspaceToolMCPStdioBunFixtureFromWorkspace(t *testing.T) {
+	server, _, _ := newTestServer(t)
+	workspaceRoot := t.TempDir()
+	if err := server.SetWorkspaceRoot(workspaceRoot); err != nil {
+		t.Fatalf("failed to set workspace root: %v", err)
+	}
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	fixtureSource, err := filepath.Abs(filepath.Join("..", "..", "shelleymanager", "manager", "testdata", "hl7-jira-mcp.js"))
+	if err != nil {
+		t.Fatalf("failed to resolve fixture source: %v", err)
+	}
+	fixtureData, err := os.ReadFile(fixtureSource)
+	if err != nil {
+		t.Fatalf("failed to read fixture source: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(workspaceRoot, ".demo"), 0o755); err != nil {
+		t.Fatalf("failed to create workspace fixture dir: %v", err)
+	}
+	fixturePath := filepath.Join(workspaceRoot, ".demo", "hl7-jira-mcp.js")
+	if err := os.WriteFile(fixturePath, fixtureData, 0o755); err != nil {
+		t.Fatalf("failed to write workspace fixture: %v", err)
+	}
+
+	createWorkspaceTool(t, httpServer.URL, `{
+		"name":"hl7-jira",
+		"description":"Search realistic HL7 Jira fixture data",
+		"protocol":"mcp",
+		"transport":{
+			"type":"stdio",
+			"command":"bun",
+			"args":["./.demo/hl7-jira-mcp.js"],
+			"cwd":"."
+		},
+		"tools":[
+			{
+				"name":"jira.search",
+				"description":"Search realistic HL7 Jira issues related to validation and FHIRPath behavior",
+				"inputSchema":{
+					"type":"object",
+					"properties":{"query":{"type":"string"}},
+					"required":["query"],
+					"additionalProperties":false
+				}
+			}
+		]
+	}`)
+	createWorkspaceGrant(t, httpServer.URL, "hl7-jira", `{
+		"subject":"agent:*",
+		"tools":["jira.search"],
+		"access":"allowed"
+	}`)
+
+	tool := workspaceRuntimeTool(t, server, "alpha", "workspace_hl7-jira")
+	result := tool.Run(context.Background(), []byte(`{"action":"jira.search","input":{"query":"validation error handling"}}`))
+	if result.Error != nil {
+		t.Fatalf("expected bun fixture mcp tool to succeed, got %v", result.Error)
+	}
+	if len(result.LLMContent) == 0 || !strings.Contains(result.LLMContent[0].Text, "FHIR-53953") {
+		t.Fatalf("expected Jira fixture content in tool output, got %#v", result.LLMContent)
 	}
 }
 

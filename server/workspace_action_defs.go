@@ -8,15 +8,21 @@ import (
 )
 
 type workspaceActionDef struct {
-	Name        string          `json:"name"`
-	Description string          `json:"description,omitempty"`
-	InputSchema json.RawMessage `json:"inputSchema,omitempty"`
+	Name         string          `json:"name"`
+	Title        string          `json:"title,omitempty"`
+	Description  string          `json:"description,omitempty"`
+	InputSchema  json.RawMessage `json:"inputSchema,omitempty"`
+	OutputSchema json.RawMessage `json:"outputSchema,omitempty"`
+	Annotations  json.RawMessage `json:"annotations,omitempty"`
 }
 
 type workspaceActionInfo struct {
-	Name        string          `json:"name"`
-	Description string          `json:"description,omitempty"`
-	InputSchema json.RawMessage `json:"inputSchema,omitempty"`
+	Name         string          `json:"name"`
+	Title        string          `json:"title,omitempty"`
+	Description  string          `json:"description,omitempty"`
+	InputSchema  json.RawMessage `json:"inputSchema,omitempty"`
+	OutputSchema json.RawMessage `json:"outputSchema,omitempty"`
+	Annotations  json.RawMessage `json:"annotations,omitempty"`
 }
 
 func normalizeWorkspaceActionDefs(raw json.RawMessage) ([]workspaceActionDef, error) {
@@ -53,6 +59,7 @@ func validateWorkspaceActionDefs(defs []workspaceActionDef) ([]workspaceActionDe
 	validated := make([]workspaceActionDef, 0, len(defs))
 	for _, def := range defs {
 		def.Name = strings.TrimSpace(def.Name)
+		def.Title = strings.TrimSpace(def.Title)
 		def.Description = strings.TrimSpace(def.Description)
 		if def.Name == "" {
 			return nil, fmt.Errorf("action name required")
@@ -66,6 +73,16 @@ func validateWorkspaceActionDefs(defs []workspaceActionDef) ([]workspaceActionDe
 			return nil, err
 		}
 		def.InputSchema = normalizedSchema
+		normalizedOutputSchema, err := validateWorkspaceOptionalSchema(def.OutputSchema, def.Name, "outputSchema")
+		if err != nil {
+			return nil, err
+		}
+		def.OutputSchema = normalizedOutputSchema
+		normalizedAnnotations, err := validateWorkspaceOptionalObject(def.Annotations, def.Name, "annotations")
+		if err != nil {
+			return nil, err
+		}
+		def.Annotations = normalizedAnnotations
 		validated = append(validated, def)
 	}
 
@@ -115,9 +132,12 @@ func workspaceActionInfos(defs []workspaceActionDef) []workspaceActionInfo {
 	infos := make([]workspaceActionInfo, 0, len(defs))
 	for _, def := range defs {
 		infos = append(infos, workspaceActionInfo{
-			Name:        def.Name,
-			Description: def.Description,
-			InputSchema: append(json.RawMessage(nil), def.InputSchema...),
+			Name:         def.Name,
+			Title:        def.Title,
+			Description:  def.Description,
+			InputSchema:  append(json.RawMessage(nil), def.InputSchema...),
+			OutputSchema: append(json.RawMessage(nil), def.OutputSchema...),
+			Annotations:  append(json.RawMessage(nil), def.Annotations...),
 		})
 	}
 	return infos
@@ -160,4 +180,27 @@ func workspaceActionSchemaAny(def workspaceActionDef) (any, error) {
 		return nil, err
 	}
 	return schema, nil
+}
+
+func validateWorkspaceOptionalSchema(raw json.RawMessage, actionName, fieldName string) (json.RawMessage, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+
+	var schema map[string]any
+	if err := json.Unmarshal(raw, &schema); err != nil {
+		return nil, fmt.Errorf("invalid %s for action %s: %w", fieldName, actionName, err)
+	}
+	if len(schema) == 0 {
+		return nil, fmt.Errorf("%s for action %s must be a JSON object", fieldName, actionName)
+	}
+	normalized, err := json.Marshal(schema)
+	if err != nil {
+		return nil, fmt.Errorf("marshal %s for action %s: %w", fieldName, actionName, err)
+	}
+	return normalized, nil
+}
+
+func validateWorkspaceOptionalObject(raw json.RawMessage, actionName, fieldName string) (json.RawMessage, error) {
+	return validateWorkspaceOptionalSchema(raw, actionName, fieldName)
 }
