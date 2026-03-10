@@ -37,19 +37,27 @@ type workspaceTopicCreateRequest struct {
 }
 
 type workspaceWSMessage struct {
-	Type       string `json:"type"`
-	Data       string `json:"data,omitempty"`
-	Topic      string `json:"topic,omitempty"`
-	SessionID  string `json:"sessionId,omitempty"`
-	ToolCallID string `json:"toolCallId,omitempty"`
-	Title      string `json:"title,omitempty"`
-	Kind       string `json:"kind,omitempty"`
-	Status     string `json:"status,omitempty"`
+	Type       string   `json:"type"`
+	Data       string   `json:"data,omitempty"`
+	Topic      string   `json:"topic,omitempty"`
+	SessionID  string   `json:"sessionId,omitempty"`
+	ToolCallID string   `json:"toolCallId,omitempty"`
+	Title      string   `json:"title,omitempty"`
+	Kind       string   `json:"kind,omitempty"`
+	Status     string   `json:"status,omitempty"`
+	Tool       string   `json:"tool,omitempty"`
+	Action     string   `json:"action,omitempty"`
+	Approvers  []string `json:"approvers,omitempty"`
+	Approved   bool     `json:"approved,omitempty"`
+	Approver   string   `json:"approver,omitempty"`
 }
 
 type workspacePromptMessage struct {
-	Type string `json:"type"`
-	Data string `json:"data,omitempty"`
+	Type       string `json:"type"`
+	Data       string `json:"data,omitempty"`
+	ToolCallID string `json:"toolCallId,omitempty"`
+	Approved   bool   `json:"approved,omitempty"`
+	Approver   string `json:"approver,omitempty"`
 }
 
 type workspaceManagerInfo struct {
@@ -370,15 +378,23 @@ func (s *Server) handleWorkspaceTopicWSForName(w http.ResponseWriter, r *http.Re
 			return
 		}
 
-		if msg.Type != "prompt" {
-			continue
+		switch msg.Type {
+		case "prompt":
+			prompt := strings.TrimSpace(msg.Data)
+			if prompt == "" {
+				continue
+			}
+			topic.EnqueuePrompt(prompt, clientID)
+		case "approval_response":
+			if msg.ToolCallID == "" {
+				continue
+			}
+			topic.ResolveApprovalResponse(workspaceApprovalResponse{
+				ToolCallID: msg.ToolCallID,
+				Approved:   msg.Approved,
+				Approver:   strings.TrimSpace(msg.Approver),
+			})
 		}
-		prompt := strings.TrimSpace(msg.Data)
-		if prompt == "" {
-			continue
-		}
-
-		topic.EnqueuePrompt(prompt, clientID)
 	}
 }
 
@@ -479,8 +495,13 @@ func (s *Server) getOrCreateTopicConversation(ctx context.Context, topicName str
 	if modelID != "" {
 		modelPtr = &modelID
 	}
+	cwd := s.workspaceRoot
+	var cwdPtr *string
+	if cwd != "" {
+		cwdPtr = &cwd
+	}
 
-	created, err := s.db.CreateConversation(ctx, &topicName, true, nil, modelPtr)
+	created, err := s.db.CreateConversation(ctx, &topicName, true, cwdPtr, modelPtr)
 	if err != nil {
 		// Another request may have created it between lookup and insert.
 		existing, lookupErr := s.lookupTopicConversation(ctx, topicName)

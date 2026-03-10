@@ -30,6 +30,9 @@ type Topic struct {
 
 	turnMu   sync.Mutex
 	turnDone chan struct{}
+
+	approvalMu       sync.Mutex
+	pendingApprovals map[string]chan workspaceApprovalResponse
 }
 
 type TopicManager struct {
@@ -152,16 +155,17 @@ func newTopic(server *Server, manager *ConversationManager, conversation *genera
 	runtimeCtx, runtimeCancel := context.WithCancel(context.Background())
 
 	return &Topic{
-		Name:          cfg.Name,
-		Config:        cfg,
-		Conversation:  conversation,
-		Manager:       manager,
-		WSHub:         NewWSHub(),
-		PromptQueue:   NewPromptQueue(),
-		server:        server,
-		logger:        logger,
-		runtimeCtx:    runtimeCtx,
-		runtimeCancel: runtimeCancel,
+		Name:             cfg.Name,
+		Config:           cfg,
+		Conversation:     conversation,
+		Manager:          manager,
+		WSHub:            NewWSHub(),
+		PromptQueue:      NewPromptQueue(),
+		server:           server,
+		logger:           logger,
+		runtimeCtx:       runtimeCtx,
+		runtimeCancel:    runtimeCancel,
+		pendingApprovals: make(map[string]chan workspaceApprovalResponse),
 	}
 }
 

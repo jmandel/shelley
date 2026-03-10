@@ -2,11 +2,16 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/coder/websocket"
+	"github.com/coder/websocket/wsjson"
 
 	"shelley.exe.dev/llm"
 )
@@ -386,6 +391,83 @@ func TestWorkspaceToolApprovalRequiredLogsDenied(t *testing.T) {
 
 	if toolInfo.Log[0].Action != "send" || toolInfo.Log[0].AccessDecision != workspaceGrantDenied {
 		t.Fatalf("expected approval-required call to log denied, got %#v", toolInfo.Log[0])
+	}
+}
+
+func TestWorkspaceToolApprovalResponseLogsApproved(t *testing.T) {
+	server, _, _ := newTestServer(t)
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	createWorkspaceTool(t, httpServer.URL, `{
+		"name":"gmail",
+		"actions":["send"]
+	}`)
+	createWorkspaceGrant(t, httpServer.URL, "gmail", `{
+		"subject":"agent:*",
+		"actions":["send"],
+		"access":"approval_required",
+		"approvers":["alice@example.com"]
+	}`)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws/topic/approval-live"
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("failed to dial workspace websocket: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "test complete")
+
+	waitForConnectedMessage(t, ctx, conn)
+
+	if err := wsjson.Write(ctx, conn, workspacePromptMessage{Type: "prompt", Data: "workspace_tool: gmail send"}); err != nil {
+		t.Fatalf("failed to send approval prompt: %v", err)
+	}
+
+	var approvalRequest workspaceWSMessage
+	for {
+		msg := readWorkspaceWSMessage(t, ctx, conn)
+		if msg.Type == "approval_request" {
+			approvalRequest = msg
+			break
+		}
+	}
+
+	if approvalRequest.Tool != "gmail" || approvalRequest.Action != "send" || approvalRequest.ToolCallID == "" {
+		t.Fatalf("unexpected approval request: %#v", approvalRequest)
+	}
+	if len(approvalRequest.Approvers) != 1 || approvalRequest.Approvers[0] != "alice@example.com" {
+		t.Fatalf("unexpected approval approvers: %#v", approvalRequest.Approvers)
+	}
+
+	if err := wsjson.Write(ctx, conn, workspacePromptMessage{
+		Type:       "approval_response",
+		ToolCallID: approvalRequest.ToolCallID,
+		Approved:   true,
+		Approver:   "alice@example.com",
+	}); err != nil {
+		t.Fatalf("failed to send approval response: %v", err)
+	}
+
+	for {
+		msg := readWorkspaceWSMessage(t, ctx, conn)
+		if msg.Type == "done" {
+			break
+		}
+	}
+
+	var toolInfo workspaceToolInfo
+	waitFor(t, 2*time.Second, func() bool {
+		toolInfo = getWorkspaceToolInfo(t, httpServer.URL, "gmail")
+		return len(toolInfo.Log) > 0
+	})
+
+	if toolInfo.Log[0].Action != "send" || toolInfo.Log[0].AccessDecision != "approved" || toolInfo.Log[0].ApprovedBy != "alice@example.com" {
+		t.Fatalf("expected approved audit log entry, got %#v", toolInfo.Log[0])
 	}
 }
 

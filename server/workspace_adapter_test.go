@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -258,6 +259,47 @@ func TestWorkspaceAliasRoutesAndManagerDiscovery(t *testing.T) {
 	defer precreatedResp.Body.Close()
 	if precreatedResp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200 for precreated topic, got %d", precreatedResp.StatusCode)
+	}
+}
+
+func TestWorkspaceTopicsUseConfiguredWorkspaceRoot(t *testing.T) {
+	server, database, _ := newTestServer(t)
+	workspaceRoot := t.TempDir()
+	if err := server.SetWorkspaceRoot(workspaceRoot); err != nil {
+		t.Fatalf("failed to set workspace root: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	createReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/topics", bytes.NewBufferString(`{"name":"rooted-topic"}`))
+	if err != nil {
+		t.Fatalf("failed to build rooted topic create request: %v", err)
+	}
+	createReq.Header.Set("Content-Type", "application/json")
+
+	createResp, err := http.DefaultClient.Do(createReq)
+	if err != nil {
+		t.Fatalf("failed to create rooted topic: %v", err)
+	}
+	defer createResp.Body.Close()
+	if createResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 from rooted topic create, got %d", createResp.StatusCode)
+	}
+
+	var created workspaceTopicInfo
+	if err := json.NewDecoder(createResp.Body).Decode(&created); err != nil {
+		t.Fatalf("failed to decode rooted topic response: %v", err)
+	}
+
+	conversation, err := database.GetConversationByID(context.Background(), created.SessionID)
+	if err != nil {
+		t.Fatalf("failed to load rooted conversation: %v", err)
+	}
+	if conversation.Cwd == nil || *conversation.Cwd != filepath.Clean(workspaceRoot) {
+		t.Fatalf("expected topic conversation cwd %q, got %#v", filepath.Clean(workspaceRoot), conversation.Cwd)
 	}
 }
 

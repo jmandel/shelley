@@ -85,6 +85,7 @@ func runServe(global GlobalConfig, args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	port := fs.String("port", "9000", "Port to listen on")
 	portFile := fs.String("port-file", "", "Write the actual listening port to this file (useful with --port 0)")
+	workspaceDir := fs.String("workspace-dir", "", "Workspace root directory for topic runtimes and workspace file APIs")
 	systemdActivation := fs.Bool("systemd-activation", false, "Use systemd socket activation (listen on fd from systemd)")
 	requireHeader := fs.String("require-header", "", "Require this header on all API requests (e.g., X-Exedev-Userid)")
 	socketPath := fs.String("socket", client.DefaultSocketPath(), "Path to Unix socket for local CLI client access (set to 'none' to disable)")
@@ -108,10 +109,14 @@ func runServe(global GlobalConfig, args []string) {
 	availableModels := llmManager.GetAvailableModels()
 	logger.Info("Available models", "models", strings.Join(availableModels, ", "))
 
-	toolSetConfig := setupToolSetConfig(llmManager, llmManager)
+	toolSetConfig := setupToolSetConfig(llmManager, llmManager, *workspaceDir)
 
 	// Create server
 	svr := server.NewServer(database, llmManager, toolSetConfig, logger, global.PredictableOnly, llmConfig.TerminalURL, llmConfig.DefaultModel, *requireHeader, llmConfig.Links)
+	if err := svr.SetWorkspaceRoot(*workspaceDir); err != nil {
+		logger.Error("Failed to configure workspace root", "path", *workspaceDir, "error", err)
+		os.Exit(1)
+	}
 
 	// Seed notification channels from config file if DB is empty (one-time migration)
 	svr.SeedNotificationChannelsFromConfig(llmConfig.NotificationChannels)
@@ -256,11 +261,15 @@ func runVersion() {
 	}
 }
 
-func setupToolSetConfig(llmProvider claudetool.LLMServiceProvider, llmManager server.LLMProvider) claudetool.ToolSetConfig {
-	wd, err := os.Getwd()
-	if err != nil {
-		// Fallback to "/" if we can't get working directory
-		wd = "/"
+func setupToolSetConfig(llmProvider claudetool.LLMServiceProvider, llmManager server.LLMProvider, workspaceDir string) claudetool.ToolSetConfig {
+	wd := workspaceDir
+	if wd == "" {
+		var err error
+		wd, err = os.Getwd()
+		if err != nil {
+			// Fallback to "/" if we can't get working directory
+			wd = "/"
+		}
 	}
 
 	// Build available models with display names for the subagent tool

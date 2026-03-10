@@ -269,6 +269,26 @@ func NewServer(database *db.DB, llmManager LLMProvider, toolSetConfig claudetool
 	return s
 }
 
+func (s *Server) SetWorkspaceRoot(root string) error {
+	if root == "" {
+		root = defaultWorkspaceRoot()
+	}
+
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(absRoot, 0o755); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	s.workspaceRoot = absRoot
+	s.toolSetConfig.WorkingDir = absRoot
+	s.mu.Unlock()
+	return nil
+}
+
 // RegisterNotificationChannel adds a backend notification channel to the dispatcher.
 func (s *Server) RegisterNotificationChannel(ch notifications.Channel) {
 	s.notifDispatcher.Register(ch)

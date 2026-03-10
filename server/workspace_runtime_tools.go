@@ -78,6 +78,10 @@ func (s *Server) buildTopicWorkspaceTool(ctx context.Context, topicName string, 
 	if err != nil {
 		return nil, err
 	}
+	approvalApprovers, err := workspaceActionApprovers(grantRecords, topicName, registeredActions)
+	if err != nil {
+		return nil, err
+	}
 
 	visibleActions := visibleWorkspaceActions(actionPolicies)
 	if len(visibleActions) == 0 {
@@ -87,13 +91,14 @@ func (s *Server) buildTopicWorkspaceTool(ctx context.Context, topicName string, 
 	toolCopy := toolRecord
 	policyCopy := cloneWorkspaceActionPolicies(actionPolicies)
 	actionsCopy := append([]string(nil), registeredActions...)
+	approversCopy := cloneWorkspaceActionApprovers(approvalApprovers)
 
 	return &llm.Tool{
 		Name:        "workspace_" + toolRecord.Name,
 		Description: buildWorkspaceToolDescription(toolRecord.Description, visibleActions),
 		InputSchema: buildWorkspaceToolSchema(visibleActions),
 		Run: func(ctx context.Context, input json.RawMessage) llm.ToolOut {
-			return s.runWorkspaceTool(ctx, topicName, toolCopy, actionsCopy, policyCopy, input)
+			return s.runWorkspaceTool(ctx, topicName, toolCopy, actionsCopy, policyCopy, approversCopy, input)
 		},
 	}, nil
 }
@@ -130,7 +135,7 @@ func buildWorkspaceToolSchema(actions []string) json.RawMessage {
 	return schema
 }
 
-func (s *Server) runWorkspaceTool(ctx context.Context, topicName string, toolRecord generated.WorkspaceTool, registeredActions []string, actionPolicies map[string]string, input json.RawMessage) llm.ToolOut {
+func (s *Server) runWorkspaceTool(ctx context.Context, topicName string, toolRecord generated.WorkspaceTool, registeredActions []string, actionPolicies map[string]string, approvalApprovers map[string][]string, input json.RawMessage) llm.ToolOut {
 	var req workspaceToolInvocation
 	if err := json.Unmarshal(input, &req); err != nil {
 		return llm.ToolOut{Error: fmt.Errorf("invalid workspace tool input: %w", err)}
@@ -150,18 +155,37 @@ func (s *Server) runWorkspaceTool(ctx context.Context, topicName string, toolRec
 	if access == workspaceGrantAllowed {
 		decision = workspaceGrantAllowed
 	}
-	if err := s.recordWorkspaceToolLog(ctx, toolRecord, topicName, req.Action, subject, decision, "", input); err != nil {
-		return llm.ToolOut{Error: err}
-	}
 
 	switch access {
 	case workspaceGrantAllowed:
+		if err := s.recordWorkspaceToolLog(ctx, toolRecord, topicName, req.Action, subject, decision, "", input); err != nil {
+			return llm.ToolOut{Error: err}
+		}
 		return llm.ToolOut{Error: fmt.Errorf("workspace tool execution not implemented for %s/%s", toolRecord.Name, req.Action)}
 	case workspaceGrantApprovalRequired:
-		return llm.ToolOut{Error: fmt.Errorf("approval required for %s/%s; approval workflow not implemented", toolRecord.Name, req.Action)}
+		approved, approver, err := s.requestWorkspaceToolApproval(ctx, topicName, toolRecord, req.Action, approvalApprovers[req.Action], input)
+		if err != nil {
+			return llm.ToolOut{Error: err}
+		}
+		if !approved {
+			if err := s.recordWorkspaceToolLog(ctx, toolRecord, topicName, req.Action, subject, workspaceGrantDenied, approver, input); err != nil {
+				return llm.ToolOut{Error: err}
+			}
+			return llm.ToolOut{Error: fmt.Errorf("approval denied for %s/%s", toolRecord.Name, req.Action)}
+		}
+		if err := s.recordWorkspaceToolLog(ctx, toolRecord, topicName, req.Action, subject, "approved", approver, input); err != nil {
+			return llm.ToolOut{Error: err}
+		}
+		return llm.ToolOut{Error: fmt.Errorf("workspace tool execution not implemented for %s/%s", toolRecord.Name, req.Action)}
 	case workspaceGrantDenied:
+		if err := s.recordWorkspaceToolLog(ctx, toolRecord, topicName, req.Action, subject, decision, "", input); err != nil {
+			return llm.ToolOut{Error: err}
+		}
 		return llm.ToolOut{Error: fmt.Errorf("access denied for %s/%s", toolRecord.Name, req.Action)}
 	default:
+		if err := s.recordWorkspaceToolLog(ctx, toolRecord, topicName, req.Action, subject, decision, "", input); err != nil {
+			return llm.ToolOut{Error: err}
+		}
 		return llm.ToolOut{Error: fmt.Errorf("no grant for %s/%s", toolRecord.Name, req.Action)}
 	}
 }
@@ -232,6 +256,44 @@ func workspaceActionPolicies(grantRecords []generated.WorkspaceGrant, topicName 
 	return policies, nil
 }
 
+func workspaceActionApprovers(grantRecords []generated.WorkspaceGrant, topicName string, registeredActions []string) (map[string][]string, error) {
+	validActions := make(map[string]struct{}, len(registeredActions))
+	for _, action := range registeredActions {
+		validActions[action] = struct{}{}
+	}
+
+	approversByAction := make(map[string][]string)
+	for _, grant := range grantRecords {
+		if grant.Access != workspaceGrantApprovalRequired || !workspaceGrantAppliesToTopic(grant.Subject, topicName) {
+			continue
+		}
+
+		grantActions, err := decodeJSONStringSlice(grant.Actions)
+		if err != nil {
+			return nil, err
+		}
+		var approvers []string
+		if grant.Approvers != nil {
+			approvers, err = decodeJSONStringSlice(*grant.Approvers)
+			if err != nil {
+				return nil, err
+			}
+		}
+		for _, action := range grantActions {
+			if _, ok := validActions[action]; !ok {
+				continue
+			}
+			for _, approver := range approvers {
+				if !containsString(approversByAction[action], approver) {
+					approversByAction[action] = append(approversByAction[action], approver)
+				}
+			}
+		}
+	}
+
+	return approversByAction, nil
+}
+
 func workspaceGrantAppliesToTopic(subject, topicName string) bool {
 	return subject == "agent:*" || subject == "agent:"+topicName
 }
@@ -276,6 +338,34 @@ func cloneWorkspaceActionPolicies(actionPolicies map[string]string) map[string]s
 		cloned[action] = access
 	}
 	return cloned
+}
+
+func cloneWorkspaceActionApprovers(approversByAction map[string][]string) map[string][]string {
+	if len(approversByAction) == 0 {
+		return nil
+	}
+	cloned := make(map[string][]string, len(approversByAction))
+	for action, approvers := range approversByAction {
+		cloned[action] = append([]string(nil), approvers...)
+	}
+	return cloned
+}
+
+func (s *Server) requestWorkspaceToolApproval(ctx context.Context, topicName string, toolRecord generated.WorkspaceTool, action string, approvers []string, input json.RawMessage) (bool, string, error) {
+	topic := s.topicManager.GetTopic(topicName)
+	if topic == nil {
+		return false, "", fmt.Errorf("topic runtime unavailable for approval: %s", topicName)
+	}
+
+	req := workspaceApprovalRequest{
+		ToolCallID: uuid.NewString(),
+		Tool:       toolRecord.Name,
+		Action:     action,
+		Summary:    summarizeWorkspaceToolInput(input),
+		Approvers:  append([]string(nil), approvers...),
+	}
+	resp, approved := topic.RequestApproval(ctx, req)
+	return approved, resp.Approver, nil
 }
 
 func containsString(values []string, want string) bool {
