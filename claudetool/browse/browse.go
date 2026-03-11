@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -133,6 +134,11 @@ func (b *BrowseTools) GetBrowserContext() (context.Context, error) {
 
 	// Initialize a new browser
 	opts := chromedp.DefaultExecAllocatorOptions[:]
+	execPath, err := resolveBrowserExecutable()
+	if err != nil {
+		return nil, fmt.Errorf("failed to locate browser executable: %w", err)
+	}
+	opts = append(opts, chromedp.ExecPath(execPath))
 	opts = append(opts, chromedp.NoSandbox)
 	opts = append(opts, chromedp.Flag("--disable-dbus", true))
 	opts = append(opts, chromedp.WSURLReadTimeout(60*time.Second))
@@ -186,6 +192,36 @@ func (b *BrowseTools) GetBrowserContext() (context.Context, error) {
 	b.resetIdleTimerLocked()
 
 	return b.browserCtx, nil
+}
+
+func resolveBrowserExecutable() (string, error) {
+	candidates := []string{
+		"google-chrome",
+		"google-chrome-stable",
+		"chromium",
+		"chromium-browser",
+	}
+	for _, candidate := range candidates {
+		path, err := exec.LookPath(candidate)
+		if err != nil {
+			continue
+		}
+		if browserExecutableLooksUsable(path) {
+			return path, nil
+		}
+	}
+	return "", fmt.Errorf("no supported browser found in PATH (tried %s)", strings.Join(candidates, ", "))
+}
+
+func browserExecutableLooksUsable(path string) bool {
+	if filepath.Base(path) != "chromium-browser" {
+		return true
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	return !strings.Contains(string(content), "/snap/bin/chromium")
 }
 
 // resetIdleTimerLocked resets or starts the idle timer. Caller must hold b.mux.
