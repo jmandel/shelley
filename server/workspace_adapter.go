@@ -23,12 +23,33 @@ import (
 )
 
 type workspaceTopicInfo struct {
-	Name      string `json:"name"`
-	Clients   int    `json:"clients"`
-	Busy      bool   `json:"busy"`
-	LogSize   int64  `json:"logSize"`
-	Events    string `json:"events,omitempty"`
-	CreatedAt string `json:"createdAt"`
+	Name       string              `json:"name"`
+	Clients    int                 `json:"clients"`
+	ActiveRun  *workspaceRunState  `json:"activeRun,omitempty"`
+	QueuedCount int                `json:"queuedCount"`
+	LogSize    int64               `json:"logSize"`
+	Events     string              `json:"events,omitempty"`
+	CreatedAt  string              `json:"createdAt"`
+}
+
+type workspaceTopicState struct {
+	Name      string              `json:"name"`
+	ActiveRun *workspaceRunState  `json:"activeRun,omitempty"`
+	Queue     []workspaceRunState `json:"queue,omitempty"`
+	CreatedAt string              `json:"createdAt,omitempty"`
+	Events    string              `json:"events,omitempty"`
+}
+
+type workspaceRunState struct {
+	RunID         string               `json:"runId"`
+	State         string               `json:"state"`
+	Text          string               `json:"text,omitempty"`
+	CreatedAt     string               `json:"createdAt,omitempty"`
+	Position      int                  `json:"position,omitempty"`
+	Reason        string               `json:"reason,omitempty"`
+	Interruptible bool                 `json:"interruptible,omitempty"`
+	SubmittedBy   *workspaceSubjectRef `json:"submittedBy,omitempty"`
+	InterruptedBy *workspaceSubjectRef `json:"interruptedBy,omitempty"`
 }
 
 type workspaceTopicCreateRequest struct {
@@ -38,18 +59,20 @@ type workspaceTopicCreateRequest struct {
 type workspaceWSMessage struct {
 	Type            string                `json:"type"`
 	Data            string                `json:"data,omitempty"`
+	Text            string                `json:"text,omitempty"`
 	Topic           string                `json:"topic,omitempty"`
 	ProtocolVersion string                `json:"protocolVersion,omitempty"`
 	Replay          bool                  `json:"replay,omitempty"`
 	EventID         string                `json:"eventId,omitempty"`
 	Timestamp       string                `json:"timestamp,omitempty"`
-	PromptID        string                `json:"promptId,omitempty"`
-	ActivePromptID  string                `json:"activePromptId,omitempty"`
+	Actor           *workspaceSubjectRef  `json:"actor,omitempty"`
+	RunID           string                `json:"runId,omitempty"`
+	Role            string                `json:"role,omitempty"`
+	State           string                `json:"state,omitempty"`
 	InjectID        string                `json:"injectId,omitempty"`
 	Position        int                   `json:"position,omitempty"`
 	Reason          string                `json:"reason,omitempty"`
 	Removed         []string              `json:"removed,omitempty"`
-	Direction       string                `json:"direction,omitempty"`
 	ToolCallID      string                `json:"toolCallId,omitempty"`
 	Title           string                `json:"title,omitempty"`
 	Kind            string                `json:"kind,omitempty"`
@@ -60,16 +83,15 @@ type workspaceWSMessage struct {
 	Approvers       []string              `json:"approvers,omitempty"`
 	Approved        bool                  `json:"approved,omitempty"`
 	Approver        string                `json:"approver,omitempty"`
-	Injected        bool                  `json:"injected,omitempty"`
 	SubmittedBy     *workspaceSubjectRef  `json:"submittedBy,omitempty"`
 	InterruptedBy   *workspaceSubjectRef  `json:"interruptedBy,omitempty"`
-	Entries         []workspaceQueueEntry `json:"entries,omitempty"`
+	ActiveRun       *workspaceRunState    `json:"activeRun,omitempty"`
+	Queue           []workspaceRunState   `json:"queue,omitempty"`
 }
 
 type workspacePromptMessage struct {
 	Type       string `json:"type"`
 	Data       string `json:"data,omitempty"`
-	PromptID   string `json:"promptId,omitempty"`
 	InjectID   string `json:"injectId,omitempty"`
 	Position   *int   `json:"position,omitempty"`
 	Reason     string `json:"reason,omitempty"`
@@ -81,20 +103,6 @@ type workspacePromptMessage struct {
 type workspaceSubjectRef struct {
 	ID          string `json:"id"`
 	DisplayName string `json:"displayName,omitempty"`
-}
-
-type workspaceQueueEntry struct {
-	PromptID    string              `json:"promptId"`
-	Status      string              `json:"status"`
-	Text        string              `json:"text"`
-	CreatedAt   string              `json:"createdAt"`
-	Position    int                 `json:"position,omitempty"`
-	SubmittedBy workspaceSubjectRef `json:"submittedBy"`
-}
-
-type workspaceQueueSnapshot struct {
-	ActivePromptID string                `json:"activePromptId,omitempty"`
-	Entries        []workspaceQueueEntry `json:"entries"`
 }
 
 type workspaceQueueClearResponse struct {
@@ -223,26 +231,19 @@ func (s *Server) handleWorkspaceTopic(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		conversation, err := s.getActiveTopicConversation(r.Context(), topicName)
+		topic, err := s.resolveWorkspaceTopicRuntime(r.Context(), topicName)
 		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				http.Error(w, "Topic not found", http.StatusNotFound)
+				return
+			}
 			s.logger.Error("Failed to get workspace topic", "topic", topicName, "error", err)
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
-			return
-		}
-		if conversation == nil {
-			http.Error(w, "Topic not found", http.StatusNotFound)
-			return
-		}
-
-		info, err := s.workspaceTopicInfo(r.Context(), r, topicName, *conversation)
-		if err != nil {
-			s.logger.Error("Failed to build workspace topic info", "topic", topicName, "error", err)
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(info)
+		json.NewEncoder(w).Encode(s.workspaceTopicState(r, topic))
 	case http.MethodDelete:
 		conversation, err := s.getActiveTopicConversation(r.Context(), topicName)
 		if err != nil {
@@ -335,19 +336,22 @@ func (s *Server) handleWorkspaceTopicWSForName(w http.ResponseWriter, r *http.Re
 		ProtocolVersion: workspaceProtocolVersion,
 		Replay:          true,
 	})
+
+	topicStateMsg := topic.TopicStateMessage("connect")
+	topicStateMsg.Replay = true
+	topic.sendWSMessage(ctx, outCh, topicStateMsg)
+
 	if state == topicConversationCreated {
 		go s.publishConversationListUpdate(ConversationListUpdate{
 			Type:         "update",
 			Conversation: topic.Conversation,
 		})
-		topic.sendWSMessage(ctx, outCh, workspaceWSMessage{Type: "system", Data: "starting agent..."})
 	}
 	if state == topicConversationRestored {
 		go s.publishConversationListUpdate(ConversationListUpdate{
 			Type:         "update",
 			Conversation: topic.Conversation,
 		})
-		topic.sendWSMessage(ctx, outCh, workspaceWSMessage{Type: "system", Data: "restoring archived topic..."})
 	}
 	replayMessages, err := s.replayWorkspaceTopicMessages(ctx, topic.Conversation.ConversationID)
 	if err != nil {
@@ -356,12 +360,6 @@ func (s *Server) handleWorkspaceTopicWSForName(w http.ResponseWriter, r *http.Re
 		for _, replayMsg := range replayMessages {
 			replayMsg.Replay = true
 			topic.sendWSMessage(ctx, outCh, replayMsg)
-		}
-		snapshotMsg := workspaceQueueSnapshotMessage(topic)
-		snapshotMsg.Replay = true
-		topic.sendWSMessage(ctx, outCh, snapshotMsg)
-		if topic.IsBusy() {
-			topic.sendWSMessage(ctx, outCh, workspaceWSMessage{Type: "system", Data: "thinking...", Replay: true})
 		}
 	}
 
@@ -396,38 +394,36 @@ func (s *Server) handleWorkspaceTopicWSForName(w http.ResponseWriter, r *http.Re
 					Status: "rejected",
 					Reason: "empty_inject",
 				})
-				topic.sendWSMessage(ctx, outCh, workspaceWSMessage{Type: "error", Data: "data is required"})
 				continue
 			}
-			if rejected, err := topic.InjectMessage("", injectText, submittedBy); err != nil {
-				if rejected.Type != "" {
-					topic.sendWSMessage(ctx, outCh, rejected)
+			if status, err := topic.InjectMessage("", injectText, submittedBy); err != nil {
+				if status.Type != "" {
+					topic.sendWSMessage(ctx, outCh, status)
+					if status.Status == "rejected" {
+						continue
+					}
 				}
 				topic.sendWSMessage(ctx, outCh, workspaceWSMessage{Type: "error", Data: err.Error()})
+			} else {
+				topic.sendWSMessage(ctx, outCh, status)
 			}
 		case "interrupt":
 			reason := strings.TrimSpace(msg.Reason)
 			if reason == "" {
-				topic.sendWSMessage(ctx, outCh, workspaceWSMessage{Type: "error", Data: "reason is required"})
+				topic.sendWSMessage(ctx, outCh, workspaceWSMessage{Type: "interrupt_status", Status: "rejected", Reason: "missing_reason"})
 				continue
 			}
-			if _, err := topic.InterruptTurn(reason, submittedBy); err != nil {
+			if status, err := topic.InterruptTurn(reason, submittedBy); err != nil {
+				if status.Type != "" {
+					topic.sendWSMessage(ctx, outCh, status)
+					if status.Status == "rejected" {
+						continue
+					}
+				}
 				topic.sendWSMessage(ctx, outCh, workspaceWSMessage{Type: "error", Data: err.Error()})
+			} else {
+				topic.sendWSMessage(ctx, outCh, status)
 			}
-		case "cancel_prompt":
-			if msg.PromptID == "" {
-				topic.sendWSMessage(ctx, outCh, workspaceWSMessage{Type: "error", Data: "promptId is required"})
-				continue
-			}
-			if err := topic.CancelQueuedPrompt(msg.PromptID, submittedBy.ID); err != nil {
-				topic.sendWSMessage(ctx, outCh, workspaceWSMessage{Type: "error", PromptID: msg.PromptID, Data: err.Error()})
-			}
-		case "clear_my_prompts":
-			removed := topic.ClearQueuedPromptsForSender(submittedBy.ID)
-			topic.sendWSMessage(ctx, outCh, workspaceWSMessage{
-				Type:    "queue_cleared",
-				Removed: removed,
-			})
 		case "approval_response":
 			if msg.ToolCallID == "" {
 				continue
@@ -441,37 +437,15 @@ func (s *Server) handleWorkspaceTopicWSForName(w http.ResponseWriter, r *http.Re
 	}
 }
 
-func (s *Server) handleWorkspaceTopicQueue(w http.ResponseWriter, r *http.Request) {
-	topicName, err := sanitizeTopicName(r.PathValue("name"))
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	topic, err := s.resolveWorkspaceTopicRuntime(r.Context(), topicName)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			http.Error(w, "Topic not found", http.StatusNotFound)
-			return
-		}
-		s.logger.Error("Failed to resolve workspace topic runtime", "topic", topicName, "error", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(topic.QueueSnapshot())
-}
-
 func (s *Server) handleWorkspaceTopicQueueEntry(w http.ResponseWriter, r *http.Request) {
 	topicName, err := sanitizeTopicName(r.PathValue("name"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	promptID := strings.TrimSpace(r.PathValue("prompt"))
-	if promptID == "" {
-		http.Error(w, "promptId is required", http.StatusBadRequest)
+	runID := strings.TrimSpace(r.PathValue("run"))
+	if runID == "" {
+		http.Error(w, "runId is required", http.StatusBadRequest)
 		return
 	}
 
@@ -492,7 +466,7 @@ func (s *Server) handleWorkspaceTopicQueueEntry(w http.ResponseWriter, r *http.R
 		if !ok {
 			return
 		}
-		if err := topic.CancelQueuedPrompt(promptID, principal.Subject); err != nil {
+		if err := topic.CancelQueuedPrompt(runID, principal.Subject); err != nil {
 			writeWorkspaceQueueMutationError(w, err)
 			return
 		}
@@ -512,12 +486,12 @@ func (s *Server) handleWorkspaceTopicQueueEntry(w http.ResponseWriter, r *http.R
 		if !ok {
 			return
 		}
-		if err := topic.UpdateQueuedPrompt(promptID, principal.Subject, text); err != nil {
+		if err := topic.UpdateQueuedPrompt(runID, principal.Subject, text); err != nil {
 			writeWorkspaceQueueMutationError(w, err)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(topic.QueueSnapshot())
+		json.NewEncoder(w).Encode(s.workspaceTopicState(r, topic))
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
@@ -567,9 +541,9 @@ func (s *Server) handleWorkspaceTopicQueueMove(w http.ResponseWriter, r *http.Re
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	promptID := strings.TrimSpace(r.PathValue("prompt"))
-	if promptID == "" {
-		http.Error(w, "promptId is required", http.StatusBadRequest)
+	runID := strings.TrimSpace(r.PathValue("run"))
+	if runID == "" {
+		http.Error(w, "runId is required", http.StatusBadRequest)
 		return
 	}
 
@@ -600,13 +574,13 @@ func (s *Server) handleWorkspaceTopicQueueMove(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	if err := topic.MoveQueuedPrompt(promptID, principal.Subject, req.Direction); err != nil {
+	if err := topic.MoveQueuedPrompt(runID, principal.Subject, req.Direction); err != nil {
 		writeWorkspaceQueueMutationError(w, err)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(topic.QueueSnapshot())
+	json.NewEncoder(w).Encode(s.workspaceTopicState(r, topic))
 }
 
 func (s *Server) handleWorkspaceTopicInject(w http.ResponseWriter, r *http.Request) {
@@ -665,6 +639,7 @@ func (s *Server) handleWorkspaceTopicInject(w http.ResponseWriter, r *http.Reque
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"injectId": accepted.InjectID,
+		"runId":    accepted.RunID,
 		"status":   accepted.Status,
 	})
 }
@@ -708,14 +683,14 @@ func (s *Server) handleWorkspaceTopicInterrupt(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	doneEvent, err := topic.InterruptTurn(req.Reason, workspaceSubjectFromPrincipal(principal))
+	status, err := topic.InterruptTurn(req.Reason, workspaceSubjectFromPrincipal(principal))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(topic.stampWSMessage(doneEvent))
+	json.NewEncoder(w).Encode(status)
 }
 
 func (s *Server) resolveWorkspaceTopicRuntime(ctx context.Context, topicName string) (*Topic, error) {
@@ -743,7 +718,7 @@ func (s *Server) replayWorkspaceTopicMessages(ctx context.Context, conversationI
 	translator := newWorkspaceTranslatorState()
 	messages := make([]workspaceWSMessage, 0, len(records))
 	for _, record := range records {
-		translated, _ := translateWorkspaceWSMessagesForAPIMessage(translator, APIMessage{
+		translated, _, _ := translateWorkspaceWSMessagesForAPIMessage(translator, APIMessage{
 			Type:     record.Type,
 			LlmData:  record.LlmData,
 			UserData: record.UserData,
@@ -794,10 +769,13 @@ func (s *Server) workspaceTopicInfo(ctx context.Context, r *http.Request, topicN
 	}
 
 	clients := 0
-	busy := s.isConversationWorking(conversation.ConversationID)
+	var activeRun *workspaceRunState
+	queuedCount := 0
 	if topic := s.topicManager.GetTopic(topicName); topic != nil {
 		clients = topic.ClientCount()
-		busy = topic.IsBusy()
+		state := topic.TopicState("topic_info")
+		activeRun = state.ActiveRun
+		queuedCount = len(state.Queue)
 	}
 
 	createdAt := conversation.CreatedAt
@@ -808,13 +786,21 @@ func (s *Server) workspaceTopicInfo(ctx context.Context, r *http.Request, topicN
 	}
 
 	return workspaceTopicInfo{
-		Name:      topicName,
-		Clients:   clients,
-		Busy:      busy,
-		LogSize:   logSize,
-		Events:    workspaceTopicEventsURL(r, topicName),
-		CreatedAt: createdAt.Format(time.RFC3339),
+		Name:        topicName,
+		Clients:     clients,
+		ActiveRun:   activeRun,
+		QueuedCount: queuedCount,
+		LogSize:     logSize,
+		Events:      workspaceTopicEventsURL(r, topicName),
+		CreatedAt:   createdAt.Format(time.RFC3339),
 	}, nil
+}
+
+func (s *Server) workspaceTopicState(r *http.Request, topic *Topic) workspaceTopicState {
+	state := topic.TopicState("topic_get")
+	state.CreatedAt = topic.Conversation.CreatedAt.Format(time.RFC3339)
+	state.Events = workspaceTopicEventsURL(r, topic.Name)
+	return state
 }
 
 func (s *Server) getActiveTopicConversation(ctx context.Context, topicName string) (*generated.Conversation, error) {
@@ -1092,27 +1078,31 @@ func toolKindFromName(toolName string) string {
 	}
 }
 
-func translateWorkspaceWSMessages(translator *workspaceTranslatorState, streamData StreamResponse) ([]workspaceWSMessage, bool) {
+func translateWorkspaceWSMessages(translator *workspaceTranslatorState, streamData StreamResponse) ([]workspaceWSMessage, workspaceDoneUserData, bool) {
 	var messages []workspaceWSMessage
+	outcome := workspaceDoneUserData{}
 	turnComplete := false
 	for _, msg := range streamData.Messages {
-		translated, msgTurnComplete := translateWorkspaceWSMessagesForAPIMessage(translator, msg)
+		translated, msgOutcome, msgTurnComplete := translateWorkspaceWSMessagesForAPIMessage(translator, msg)
 		messages = append(messages, translated...)
 		if msgTurnComplete {
 			turnComplete = true
+			if msgOutcome.Status != "" || msgOutcome.Reason != "" || msgOutcome.InterruptedBy != nil {
+				outcome = msgOutcome
+			}
 		}
 	}
-	return messages, turnComplete
+	return messages, outcome, turnComplete
 }
 
-func translateWorkspaceWSMessagesForAPIMessage(translator *workspaceTranslatorState, msg APIMessage) ([]workspaceWSMessage, bool) {
+func translateWorkspaceWSMessagesForAPIMessage(translator *workspaceTranslatorState, msg APIMessage) ([]workspaceWSMessage, workspaceDoneUserData, bool) {
 	if msg.LlmData == nil {
-		return nil, false
+		return nil, workspaceDoneUserData{}, false
 	}
 
 	var llmMsg llm.Message
 	if err := json.Unmarshal([]byte(*msg.LlmData), &llmMsg); err != nil {
-		return nil, false
+		return nil, workspaceDoneUserData{}, false
 	}
 
 	messages := make([]workspaceWSMessage, 0)
@@ -1120,14 +1110,32 @@ func translateWorkspaceWSMessagesForAPIMessage(translator *workspaceTranslatorSt
 	switch msg.Type {
 	case string(dbpkg.MessageTypeAgent):
 		doneMeta, hasDoneMeta := parseWorkspaceDoneUserData(msg.UserData)
+		runID := translator.CurrentRunID()
+		outcome := workspaceDoneUserData{Status: "completed"}
+		if hasDoneMeta && doneMeta.Status != "" {
+			outcome = doneMeta
+		} else if llmMessageText(llmMsg) == "[Operation cancelled]" {
+			outcome.Status = "cancelled"
+		}
 		for _, content := range llmMsg.Content {
 			switch content.Type {
 			case llm.ContentTypeText:
-				messages = append(messages, workspaceWSMessage{Type: "text", Data: content.Text})
+				if llmMsg.EndOfTurn && content.Text == "[Operation cancelled]" {
+					continue
+				}
+				if content.Text != "" {
+					messages = append(messages, workspaceWSMessage{
+						Type:  "message",
+						Role:  "assistant",
+						RunID: runID,
+						Text:  content.Text,
+					})
+				}
 			case llm.ContentTypeToolUse:
 				translator.NoteToolCall(content.ID, content.ToolName)
 				messages = append(messages, workspaceWSMessage{
 					Type:       "tool_call",
+					RunID:      runID,
 					ToolCallID: content.ID,
 					Title:      content.ToolName,
 					Kind:       toolKindFromName(content.ToolName),
@@ -1137,29 +1145,25 @@ func translateWorkspaceWSMessagesForAPIMessage(translator *workspaceTranslatorSt
 			}
 		}
 		if llmMsg.EndOfTurn {
-			done := workspaceWSMessage{
-				Type:   "done",
-				Status: "completed",
-			}
-			if hasDoneMeta {
-				if doneMeta.Status != "" {
-					done.Status = doneMeta.Status
-				}
-				done.Reason = doneMeta.Reason
-				done.InterruptedBy = doneMeta.InterruptedBy
-			} else if llmMessageText(llmMsg) == "[Operation cancelled]" {
-				done.Status = "cancelled"
-			}
-			messages = append(messages, done)
-			return messages, true
+			translator.SetCurrentRunID("")
+			return messages, outcome, true
 		}
 	case string(dbpkg.MessageTypeUser):
 		promptMeta, hasPromptMeta := parseWorkspacePromptUserData(msg.UserData)
+		if hasPromptMeta {
+			translator.SetCurrentRunID(promptMeta.RunID)
+		}
+		runID := translator.CurrentRunID()
 		for _, content := range llmMsg.Content {
 			switch content.Type {
 			case llm.ContentTypeText:
 				if content.Text != "" {
-					userMsg := workspaceWSMessage{Type: "user", Data: content.Text}
+					userMsg := workspaceWSMessage{
+						Type:  "message",
+						Role:  "user",
+						RunID: runID,
+						Text:  content.Text,
+					}
 					if hasPromptMeta {
 						userMsg.SubmittedBy = promptMeta.SubmittedBy
 					}
@@ -1173,6 +1177,7 @@ func translateWorkspaceWSMessagesForAPIMessage(translator *workspaceTranslatorSt
 				title := translator.ToolTitle(content.ToolUseID)
 				messages = append(messages, workspaceWSMessage{
 					Type:       "tool_update",
+					RunID:      runID,
 					ToolCallID: content.ToolUseID,
 					Title:      title,
 					Status:     status,
@@ -1192,6 +1197,7 @@ func translateWorkspaceWSMessagesForAPIMessage(translator *workspaceTranslatorSt
 			title := translator.ToolTitle(content.ToolUseID)
 			messages = append(messages, workspaceWSMessage{
 				Type:       "tool_update",
+				RunID:      translator.CurrentRunID(),
 				ToolCallID: content.ToolUseID,
 				Title:      title,
 				Status:     status,
@@ -1205,7 +1211,7 @@ func translateWorkspaceWSMessagesForAPIMessage(translator *workspaceTranslatorSt
 		})
 	}
 
-	return messages, false
+	return messages, workspaceDoneUserData{}, false
 }
 
 func sendWorkspaceWSMessage(ctx context.Context, outCh chan<- workspaceWSMessage, msg workspaceWSMessage) bool {
@@ -1214,18 +1220,6 @@ func sendWorkspaceWSMessage(ctx context.Context, outCh chan<- workspaceWSMessage
 		return true
 	case <-ctx.Done():
 		return false
-	}
-}
-
-func workspaceQueueSnapshotMessage(topic *Topic) workspaceWSMessage {
-	snapshot := topic.QueueSnapshot()
-	eventID, timestamp := topic.nextEventMeta()
-	return workspaceWSMessage{
-		Type:           "queue_snapshot",
-		EventID:        eventID,
-		Timestamp:      timestamp,
-		ActivePromptID: snapshot.ActivePromptID,
-		Entries:        snapshot.Entries,
 	}
 }
 

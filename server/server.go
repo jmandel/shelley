@@ -372,10 +372,9 @@ func (s *Server) registerCanonicalWorkspaceRoutes(mux *http.ServeMux) {
 	mux.Handle("GET /ws/topics/{name}", http.HandlerFunc(s.handleWorkspaceTopic))
 	mux.Handle("DELETE /ws/topics/{name}", http.HandlerFunc(s.handleWorkspaceTopic))
 	mux.Handle("GET /ws/topics/{name}/events", http.HandlerFunc(s.handleWorkspaceTopicWSByName))
-	mux.Handle("GET /ws/topics/{name}/queue", http.HandlerFunc(s.handleWorkspaceTopicQueue))
-	mux.Handle("PATCH /ws/topics/{name}/queue/{prompt}", http.HandlerFunc(s.handleWorkspaceTopicQueueEntry))
-	mux.Handle("DELETE /ws/topics/{name}/queue/{prompt}", http.HandlerFunc(s.handleWorkspaceTopicQueueEntry))
-	mux.Handle("POST /ws/topics/{name}/queue/{prompt}/move", http.HandlerFunc(s.handleWorkspaceTopicQueueMove))
+	mux.Handle("PATCH /ws/topics/{name}/queue/{run}", http.HandlerFunc(s.handleWorkspaceTopicQueueEntry))
+	mux.Handle("DELETE /ws/topics/{name}/queue/{run}", http.HandlerFunc(s.handleWorkspaceTopicQueueEntry))
+	mux.Handle("POST /ws/topics/{name}/queue/{run}/move", http.HandlerFunc(s.handleWorkspaceTopicQueueMove))
 	mux.Handle("POST /ws/topics/{name}/queue:clear-mine", http.HandlerFunc(s.handleWorkspaceTopicQueueClearMine))
 	mux.Handle("POST /ws/topics/{name}/inject", http.HandlerFunc(s.handleWorkspaceTopicInject))
 	mux.Handle("POST /ws/topics/{name}/interrupt", http.HandlerFunc(s.handleWorkspaceTopicInterrupt))
@@ -402,10 +401,9 @@ func (s *Server) registerWorkspaceCompatibilityRoutes(mux *http.ServeMux) {
 	mux.Handle("GET /topics/{name}", http.HandlerFunc(s.handleWorkspaceTopic))
 	mux.Handle("DELETE /topics/{name}", http.HandlerFunc(s.handleWorkspaceTopic))
 	mux.Handle("GET /topics/{name}/events", http.HandlerFunc(s.handleWorkspaceTopicWSByName))
-	mux.Handle("GET /topics/{name}/queue", http.HandlerFunc(s.handleWorkspaceTopicQueue))
-	mux.Handle("PATCH /topics/{name}/queue/{prompt}", http.HandlerFunc(s.handleWorkspaceTopicQueueEntry))
-	mux.Handle("DELETE /topics/{name}/queue/{prompt}", http.HandlerFunc(s.handleWorkspaceTopicQueueEntry))
-	mux.Handle("POST /topics/{name}/queue/{prompt}/move", http.HandlerFunc(s.handleWorkspaceTopicQueueMove))
+	mux.Handle("PATCH /topics/{name}/queue/{run}", http.HandlerFunc(s.handleWorkspaceTopicQueueEntry))
+	mux.Handle("DELETE /topics/{name}/queue/{run}", http.HandlerFunc(s.handleWorkspaceTopicQueueEntry))
+	mux.Handle("POST /topics/{name}/queue/{run}/move", http.HandlerFunc(s.handleWorkspaceTopicQueueMove))
 	mux.Handle("POST /topics/{name}/queue:clear-mine", http.HandlerFunc(s.handleWorkspaceTopicQueueClearMine))
 	mux.Handle("POST /topics/{name}/inject", http.HandlerFunc(s.handleWorkspaceTopicInject))
 	mux.Handle("POST /topics/{name}/interrupt", http.HandlerFunc(s.handleWorkspaceTopicInterrupt))
@@ -1026,11 +1024,6 @@ func (s *Server) notifySubscribersNewMessage(ctx context.Context, conversationID
 	// Convert the single new message to API format
 	apiMessages := toAPIMessages([]generated.Message{*newMsg})
 
-	// Update agent working state based on message type
-	if isAgentEndOfTurn(newMsg) {
-		manager.SetAgentWorking(false)
-	}
-
 	// Publish only the new message
 	streamData := StreamResponse{
 		Messages:     apiMessages,
@@ -1041,6 +1034,12 @@ func (s *Server) notifySubscribersNewMessage(ctx context.Context, conversationID
 		ContextWindowSize: calculateContextWindowSizeFromMsg(newMsg),
 	}
 	manager.subpub.Publish(newMsg.SequenceID, streamData)
+
+	// Publish the terminal message before the working=false broadcast so
+	// workspace topics observe done/text before they observe idle state.
+	if isAgentEndOfTurn(newMsg) {
+		manager.SetAgentWorking(false)
+	}
 
 	// Also notify conversation list subscribers about the update (updated_at changed)
 	s.publishConversationListUpdate(ConversationListUpdate{

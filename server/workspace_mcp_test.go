@@ -467,6 +467,7 @@ func TestWorkspaceToolMCPApprovalExecutesAfterApproval(t *testing.T) {
 
 	var toolCalled bool
 	var toolUpdated bool
+	var runCompleted bool
 	var received []workspaceWSMessage
 	for {
 		msg := readWorkspaceWSMessage(t, ctx, conn)
@@ -477,7 +478,8 @@ func TestWorkspaceToolMCPApprovalExecutesAfterApproval(t *testing.T) {
 		if msg.Type == "tool_update" && msg.Title == "workspace_approval-greeter" && msg.Status == "completed" {
 			toolUpdated = true
 		}
-		if msg.Type == "done" {
+		if msg.Type == "run_updated" && msg.State == string(PromptStatusCompleted) {
+			runCompleted = true
 			break
 		}
 	}
@@ -486,6 +488,9 @@ func TestWorkspaceToolMCPApprovalExecutesAfterApproval(t *testing.T) {
 	}
 	if !toolUpdated {
 		t.Fatalf("expected workspace tool update after approval, got %#v", received)
+	}
+	if !runCompleted {
+		t.Fatalf("expected run completion after approval, got %#v", received)
 	}
 
 	waitFor(t, 2*time.Second, func() bool {

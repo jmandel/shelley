@@ -7,7 +7,7 @@ const (
 )
 
 type workspacePromptUserData struct {
-	PromptID    string               `json:"promptId,omitempty"`
+	RunID       string               `json:"runId,omitempty"`
 	SubmittedBy *workspaceSubjectRef `json:"submittedBy,omitempty"`
 }
 
@@ -55,7 +55,8 @@ func workspaceParticipantRef(subject workspaceSubjectRef) *workspaceSubjectRef {
 }
 
 type workspaceTranslatorState struct {
-	toolTitles map[string]string
+	toolTitles   map[string]string
+	currentRunID string
 }
 
 func newWorkspaceTranslatorState() *workspaceTranslatorState {
@@ -75,4 +76,12 @@ func (s *workspaceTranslatorState) ToolTitle(toolCallID string) string {
 		return title
 	}
 	return toolCallID
+}
+
+func (s *workspaceTranslatorState) SetCurrentRunID(runID string) {
+	s.currentRunID = runID
+}
+
+func (s *workspaceTranslatorState) CurrentRunID() string {
+	return s.currentRunID
 }

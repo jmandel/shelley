@@ -58,6 +58,9 @@ func TestWorkspaceTopicsLifecycle(t *testing.T) {
 	if !strings.HasSuffix(created.Events, "/ws/topics/debug-timeout/events") {
 		t.Fatalf("expected topic events URL, got %q", created.Events)
 	}
+	if created.ActiveRun != nil || created.QueuedCount != 0 {
+		t.Fatalf("expected created topic summary to be idle, got %#v", created)
+	}
 	if _, err := time.Parse(time.RFC3339, created.CreatedAt); err != nil {
 		t.Fatalf("expected RFC3339 createdAt, got %q: %v", created.CreatedAt, err)
 	}
@@ -72,15 +75,15 @@ func TestWorkspaceTopicsLifecycle(t *testing.T) {
 		t.Fatalf("expected 200 from get topic, got %d", topicResp.StatusCode)
 	}
 
-	var fetched workspaceTopicInfo
+	var fetched workspaceTopicState
 	if err := json.NewDecoder(topicResp.Body).Decode(&fetched); err != nil {
 		t.Fatalf("failed to decode topic response: %v", err)
 	}
 	if fetched.Events != created.Events {
 		t.Fatalf("expected events URL %q, got %q", created.Events, fetched.Events)
 	}
-	if fetched.Clients != 0 {
-		t.Fatalf("expected 0 clients before websocket connect, got %d", fetched.Clients)
+	if fetched.ActiveRun != nil || len(fetched.Queue) != 0 {
+		t.Fatalf("expected fetched topic state to be idle, got %#v", fetched)
 	}
 
 	topicsResp, err := http.Get(httpServer.URL + "/ws/topics")
@@ -98,6 +101,9 @@ func TestWorkspaceTopicsLifecycle(t *testing.T) {
 	}
 	if len(topics) != 1 || topics[0].Name != "debug-timeout" {
 		t.Fatalf("expected one topic named debug-timeout, got %#v", topics)
+	}
+	if topics[0].ActiveRun != nil || topics[0].QueuedCount != 0 {
+		t.Fatalf("expected listed topic summary to be idle, got %#v", topics[0])
 	}
 
 	deleteReq, err := http.NewRequest(http.MethodDelete, httpServer.URL+"/ws/topics/debug-timeout", nil)
@@ -287,7 +293,7 @@ func TestWorkspaceTopicQueueSnapshotReconcilesStaleActivePrompt(t *testing.T) {
 	}
 	forceStaleActivePrompt(t, topic, "p_stale_queue", "echo: stale queue", "cli-a")
 
-	req, err := http.NewRequest(http.MethodGet, httpServer.URL+"/ws/topics/stale-queue/queue", nil)
+	req, err := http.NewRequest(http.MethodGet, httpServer.URL+"/ws/topics/stale-queue", nil)
 	if err != nil {
 		t.Fatalf("failed to build queue snapshot request: %v", err)
 	}
@@ -302,11 +308,11 @@ func TestWorkspaceTopicQueueSnapshotReconcilesStaleActivePrompt(t *testing.T) {
 		t.Fatalf("expected 200 from queue snapshot, got %d: %s", resp.StatusCode, string(body))
 	}
 
-	var snapshot workspaceQueueSnapshot
+	var snapshot workspaceTopicState
 	if err := json.NewDecoder(resp.Body).Decode(&snapshot); err != nil {
-		t.Fatalf("failed to decode reconciled queue snapshot: %v", err)
+		t.Fatalf("failed to decode reconciled topic state: %v", err)
 	}
-	if snapshot.ActivePromptID != "" {
+	if snapshot.ActiveRun != nil || len(snapshot.Queue) != 0 {
 		t.Fatalf("expected stale active prompt to be cleared, got %#v", snapshot)
 	}
 	if topic.PromptQueue.ActivePromptID() != "" {
@@ -347,7 +353,7 @@ func TestWorkspaceTopicsListReconcilesStaleBusyState(t *testing.T) {
 	if len(topics) != 1 {
 		t.Fatalf("expected one topic, got %#v", topics)
 	}
-	if topics[0].Busy {
+	if topics[0].ActiveRun != nil || topics[0].QueuedCount != 0 {
 		t.Fatalf("expected stale busy topic to be reconciled, got %#v", topics[0])
 	}
 	if topic.PromptQueue.ActivePromptID() != "" {
@@ -453,16 +459,13 @@ func TestWorkspaceTopicWSQueuesPrompt(t *testing.T) {
 		t.Fatalf("failed to send second prompt: %v", err)
 	}
 
-	topicInfo := getWorkspaceTopicInfo(t, httpServer.URL+"/ws/topics/general")
-	if topicInfo.Clients != 1 {
-		t.Fatalf("expected connected topic to report 1 client, got %d", topicInfo.Clients)
-	}
-
 	var (
 		firstPromptID  string
 		secondPromptID string
 		queuedSeen     bool
 		startedSeen    bool
+		runningSeen    bool
+		idleSeen       bool
 		texts          []string
 		doneCount      int
 	)
@@ -470,23 +473,34 @@ func TestWorkspaceTopicWSQueuesPrompt(t *testing.T) {
 	for doneCount < 2 || firstPromptID == "" || secondPromptID == "" {
 		msg := readWorkspaceWSMessage(t, ctx, conn)
 		switch msg.Type {
-		case "prompt_status":
-			if msg.Status == string(PromptStatusAccepted) && msg.Data == "echo: first" {
-				firstPromptID = msg.PromptID
+		case "topic_state":
+			if msg.ActiveRun != nil && msg.ActiveRun.RunID == firstPromptID {
+				runningSeen = true
 			}
-			if msg.Status == string(PromptStatusAccepted) && msg.Data == "echo: second" {
-				secondPromptID = msg.PromptID
+			if msg.ActiveRun == nil {
+				idleSeen = true
 			}
-			if msg.PromptID == secondPromptID && msg.Status == string(PromptStatusQueued) {
+		case "run_updated":
+			if msg.Text == "echo: first" {
+				firstPromptID = msg.RunID
+			}
+			if msg.Text == "echo: second" {
+				secondPromptID = msg.RunID
+			}
+			if msg.RunID == secondPromptID && msg.State == string(PromptStatusQueued) {
 				queuedSeen = true
 			}
-			if msg.PromptID == firstPromptID && msg.Status == string(PromptStatusStarted) {
+			if msg.RunID == firstPromptID && msg.State == "running" {
 				startedSeen = true
 			}
-		case "text":
-			texts = append(texts, msg.Data)
-		case "done":
-			doneCount++
+			if msg.State == string(PromptStatusCompleted) {
+				doneCount++
+			}
+		case "message":
+			if msg.Role != "assistant" {
+				continue
+			}
+			texts = append(texts, msg.Text)
 		}
 	}
 
@@ -495,6 +509,12 @@ func TestWorkspaceTopicWSQueuesPrompt(t *testing.T) {
 	}
 	if !startedSeen {
 		t.Fatal("expected first prompt to emit started status")
+	}
+	if !runningSeen {
+		t.Fatal("expected running topic_state while first prompt is active")
+	}
+	if !idleSeen {
+		t.Fatal("expected idle topic_state after queued work completes")
 	}
 	if len(texts) < 2 {
 		t.Fatalf("expected text from both turns, got %#v", texts)
@@ -513,6 +533,100 @@ func TestWorkspaceTopicWSQueuesPrompt(t *testing.T) {
 	secondTurnText := lastUserText(requests[len(requests)-1])
 	if firstTurnText != "echo: first" || secondTurnText != "echo: second" {
 		t.Fatalf("expected prompts to run as separate turns, got first=%q second=%q", firstTurnText, secondTurnText)
+	}
+}
+
+func TestWorkspaceTopicIgnoresOtherConversationStateUpdates(t *testing.T) {
+	t.Setenv("PREDICTABLE_DELAY_MS", "500")
+
+	server, _, _ := newTestServer(t)
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws/topics/general/events"
+	conn, _, err := websocket.Dial(ctx, wsURL, workspaceAuthDialOptions(t, "viewer"))
+	if err != nil {
+		t.Fatalf("failed to dial websocket: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "test complete")
+
+	waitForConnectedMessage(t, ctx, conn)
+
+	if err := wsjson.Write(ctx, conn, workspacePromptMessage{Type: "prompt", Data: "echo: first"}); err != nil {
+		t.Fatalf("failed to send first prompt: %v", err)
+	}
+
+	var (
+		firstPromptID string
+		runningSeen   bool
+		eventLog      []workspaceWSMessage
+	)
+	for firstPromptID == "" || !runningSeen {
+		msg := readWorkspaceWSMessage(t, ctx, conn)
+		eventLog = append(eventLog, msg)
+		switch msg.Type {
+		case "run_updated":
+			if msg.Text == "echo: first" {
+				firstPromptID = msg.RunID
+			}
+			if msg.State == "running" {
+				firstPromptID = msg.RunID
+				runningSeen = true
+			}
+		case "topic_state":
+			if msg.ActiveRun != nil && msg.ActiveRun.RunID == firstPromptID {
+				runningSeen = true
+			}
+		}
+	}
+
+	server.publishConversationState(ConversationState{
+		ConversationID: "other-conversation",
+		Working:        false,
+		Model:          "predictable",
+	})
+
+	if err := wsjson.Write(ctx, conn, workspacePromptMessage{Type: "prompt", Data: "echo: second"}); err != nil {
+		t.Fatalf("failed to send second prompt: %v", err)
+	}
+
+	var (
+		firstDoneSeen    bool
+		secondPromptID   string
+		secondQueuedSeen bool
+		secondStarted    bool
+	)
+
+	for !(firstDoneSeen && secondQueuedSeen && secondStarted) {
+		msg := readWorkspaceWSMessage(t, ctx, conn)
+		eventLog = append(eventLog, msg)
+		switch msg.Type {
+		case "run_updated":
+			if msg.Text == "echo: second" {
+				secondPromptID = msg.RunID
+			}
+			if msg.RunID == secondPromptID && msg.State == string(PromptStatusQueued) {
+				secondQueuedSeen = true
+			}
+			if msg.RunID == secondPromptID && msg.State == "running" {
+				if !firstDoneSeen {
+					t.Fatalf("second prompt started before the first turn completed; events=%#v", eventLog)
+				}
+				secondStarted = true
+			}
+			if msg.RunID == firstPromptID && msg.State == string(PromptStatusCompleted) {
+				firstDoneSeen = true
+			}
+		case "topic_state":
+			if msg.ActiveRun == nil && !firstDoneSeen {
+				t.Fatalf("topic went idle because of another conversation's state update; events=%#v", eventLog)
+			}
+		}
 	}
 }
 
@@ -539,7 +653,7 @@ func TestWorkspaceTopicQueueRESTAndCancellation(t *testing.T) {
 	secondPromptID := sendWorkspacePromptAndWaitAccepted(t, ctx, conn, "echo: second", nil)
 
 	waitFor(t, 2*time.Second, func() bool {
-		req, err := http.NewRequest(http.MethodGet, httpServer.URL+"/ws/topics/queue-rest/queue", nil)
+		req, err := http.NewRequest(http.MethodGet, httpServer.URL+"/ws/topics/queue-rest", nil)
 		if err != nil {
 			return false
 		}
@@ -548,11 +662,14 @@ func TestWorkspaceTopicQueueRESTAndCancellation(t *testing.T) {
 			return false
 		}
 		defer resp.Body.Close()
-		var snapshot workspaceQueueSnapshot
+		var snapshot workspaceTopicState
 		if err := json.NewDecoder(resp.Body).Decode(&snapshot); err != nil {
 			return false
 		}
-		return snapshot.ActivePromptID == firstPromptID && len(snapshot.Entries) == 1 && snapshot.Entries[0].PromptID == secondPromptID
+		return snapshot.ActiveRun != nil &&
+			snapshot.ActiveRun.RunID == firstPromptID &&
+			len(snapshot.Queue) == 1 &&
+			snapshot.Queue[0].RunID == secondPromptID
 	})
 
 	cancelReq, err := http.NewRequest(http.MethodDelete, httpServer.URL+"/ws/topics/queue-rest/queue/"+secondPromptID, nil)
@@ -572,7 +689,7 @@ func TestWorkspaceTopicQueueRESTAndCancellation(t *testing.T) {
 	var cancelledSeen bool
 	for !cancelledSeen {
 		msg := readWorkspaceWSMessage(t, ctx, conn)
-		if msg.Type == "prompt_status" && msg.PromptID == secondPromptID && msg.Status == string(PromptStatusCancelled) {
+		if msg.Type == "run_updated" && msg.RunID == secondPromptID && msg.State == string(PromptStatusCancelled) {
 			cancelledSeen = true
 		}
 	}
@@ -602,7 +719,7 @@ func TestWorkspaceTopicQueueRESTUpdateAndMove(t *testing.T) {
 	thirdPromptID := sendWorkspacePromptAndWaitAccepted(t, ctx, conn, "echo: third", nil)
 
 	waitFor(t, 2*time.Second, func() bool {
-		req, err := http.NewRequest(http.MethodGet, httpServer.URL+"/ws/topics/queue-edit/queue", nil)
+		req, err := http.NewRequest(http.MethodGet, httpServer.URL+"/ws/topics/queue-edit", nil)
 		if err != nil {
 			return false
 		}
@@ -611,14 +728,15 @@ func TestWorkspaceTopicQueueRESTUpdateAndMove(t *testing.T) {
 			return false
 		}
 		defer resp.Body.Close()
-		var snapshot workspaceQueueSnapshot
+		var snapshot workspaceTopicState
 		if err := json.NewDecoder(resp.Body).Decode(&snapshot); err != nil {
 			return false
 		}
-		return snapshot.ActivePromptID == firstPromptID &&
-			len(snapshot.Entries) == 2 &&
-			snapshot.Entries[0].PromptID == secondPromptID &&
-			snapshot.Entries[1].PromptID == thirdPromptID
+		return snapshot.ActiveRun != nil &&
+			snapshot.ActiveRun.RunID == firstPromptID &&
+			len(snapshot.Queue) == 2 &&
+			snapshot.Queue[0].RunID == secondPromptID &&
+			snapshot.Queue[1].RunID == thirdPromptID
 	})
 
 	updateReq, err := http.NewRequest(http.MethodPatch, httpServer.URL+"/ws/topics/queue-edit/queue/"+thirdPromptID, bytes.NewBufferString(`{"data":"echo: revised third"}`))
@@ -653,20 +771,20 @@ func TestWorkspaceTopicQueueRESTUpdateAndMove(t *testing.T) {
 		updateResp.Body.Close()
 		t.Fatalf("expected 200 from queue patch, got %d: %s", updateResp.StatusCode, string(body))
 	}
-	var updatedSnapshot workspaceQueueSnapshot
+	var updatedSnapshot workspaceTopicState
 	if err := json.NewDecoder(updateResp.Body).Decode(&updatedSnapshot); err != nil {
 		updateResp.Body.Close()
 		t.Fatalf("failed to decode queue patch response: %v", err)
 	}
 	updateResp.Body.Close()
-	if got := updatedSnapshot.Entries[1].Text; got != "echo: revised third" {
+	if got := updatedSnapshot.Queue[1].Text; got != "echo: revised third" {
 		t.Fatalf("expected updated queue text, got %q", got)
 	}
 
 	var updatedSeen bool
 	for !updatedSeen {
 		msg := readWorkspaceWSMessage(t, ctx, conn)
-		if msg.Type == "queue_entry_updated" && msg.PromptID == thirdPromptID && msg.Data == "echo: revised third" {
+		if msg.Type == "run_updated" && msg.RunID == thirdPromptID && msg.State == string(PromptStatusQueued) && msg.Text == "echo: revised third" {
 			updatedSeen = true
 		}
 	}
@@ -703,20 +821,20 @@ func TestWorkspaceTopicQueueRESTUpdateAndMove(t *testing.T) {
 		moveResp.Body.Close()
 		t.Fatalf("expected 200 from queue move, got %d: %s", moveResp.StatusCode, string(body))
 	}
-	var movedSnapshot workspaceQueueSnapshot
+	var movedSnapshot workspaceTopicState
 	if err := json.NewDecoder(moveResp.Body).Decode(&movedSnapshot); err != nil {
 		moveResp.Body.Close()
 		t.Fatalf("failed to decode queue move response: %v", err)
 	}
 	moveResp.Body.Close()
-	if got := movedSnapshot.Entries[0].PromptID; got != thirdPromptID {
+	if got := movedSnapshot.Queue[0].RunID; got != thirdPromptID {
 		t.Fatalf("expected moved prompt to be first in queue, got %q", got)
 	}
 
 	var movedSeen bool
 	for !movedSeen {
 		msg := readWorkspaceWSMessage(t, ctx, conn)
-		if msg.Type == "queue_entry_moved" && msg.PromptID == thirdPromptID && msg.Direction == "top" && msg.Position == 1 {
+		if msg.Type == "run_updated" && msg.RunID == thirdPromptID && msg.State == string(PromptStatusQueued) && msg.Position == 1 {
 			movedSeen = true
 		}
 	}
@@ -736,20 +854,20 @@ func TestWorkspaceTopicQueueRESTUpdateAndMove(t *testing.T) {
 		moveBottomResp.Body.Close()
 		t.Fatalf("expected 200 from queue bottom move, got %d: %s", moveBottomResp.StatusCode, string(body))
 	}
-	var bottomSnapshot workspaceQueueSnapshot
+	var bottomSnapshot workspaceTopicState
 	if err := json.NewDecoder(moveBottomResp.Body).Decode(&bottomSnapshot); err != nil {
 		moveBottomResp.Body.Close()
 		t.Fatalf("failed to decode queue bottom move response: %v", err)
 	}
 	moveBottomResp.Body.Close()
-	if got := bottomSnapshot.Entries[len(bottomSnapshot.Entries)-1].PromptID; got != thirdPromptID {
+	if got := bottomSnapshot.Queue[len(bottomSnapshot.Queue)-1].RunID; got != thirdPromptID {
 		t.Fatalf("expected moved prompt to be last in queue after bottom move, got %q", got)
 	}
 
 	var bottomSeen bool
 	for !bottomSeen {
 		msg := readWorkspaceWSMessage(t, ctx, conn)
-		if msg.Type == "queue_entry_moved" && msg.PromptID == thirdPromptID && msg.Direction == "bottom" && msg.Position == 2 {
+		if msg.Type == "run_updated" && msg.RunID == thirdPromptID && msg.State == string(PromptStatusQueued) && msg.Position == 2 {
 			bottomSeen = true
 		}
 	}
@@ -781,26 +899,36 @@ func TestWorkspaceTopicPromptPositionFront(t *testing.T) {
 
 	var (
 		thirdQueued bool
-		donePrompts []string
+		completedRuns []string
+		eventLog    []workspaceWSMessage
 	)
 
-	for len(donePrompts) < 3 {
-		msg := readWorkspaceWSMessage(t, ctx, conn)
+	for len(completedRuns) < 3 {
+		readCtx, readCancel := context.WithTimeout(ctx, 2*time.Second)
+		var msg workspaceWSMessage
+		err := wsjson.Read(readCtx, conn, &msg)
+		readCancel()
+		if err != nil {
+			t.Fatalf("failed while waiting for front-inserted prompts to finish: %v; events=%#v", err, eventLog)
+		}
+		eventLog = append(eventLog, msg)
 		switch msg.Type {
-		case "prompt_status":
-			if msg.PromptID == thirdPromptID && msg.Status == string(PromptStatusQueued) && msg.Position == 1 {
+		case "run_updated":
+			if msg.State == string(PromptStatusCompleted) {
+				completedRuns = append(completedRuns, msg.RunID)
+			}
+		case "topic_state":
+			if len(msg.Queue) > 0 && msg.Queue[0].RunID == thirdPromptID && msg.Queue[0].Position == 1 {
 				thirdQueued = true
 			}
-		case "done":
-			donePrompts = append(donePrompts, msg.Status)
 		}
 	}
 
 	if !thirdQueued {
-		t.Fatal("expected p-3 to be queued at the front")
+		t.Fatalf("expected p-3 to be queued at the front; events=%#v", eventLog)
 	}
-	if len(donePrompts) != 3 {
-		t.Fatalf("expected 3 done events, got %d", len(donePrompts))
+	if len(completedRuns) != 3 {
+		t.Fatalf("expected 3 completed runs, got %d", len(completedRuns))
 	}
 
 	waitFor(t, 2*time.Second, func() bool {
@@ -840,9 +968,8 @@ func TestWorkspaceTopicInjectDuringActiveTurn(t *testing.T) {
 	waitForConnectedMessage(t, ctx, conn)
 
 	if err := wsjson.Write(ctx, conn, workspacePromptMessage{
-		Type:     "prompt",
-		PromptID: "p-1",
-		Data:     `ws bash "printf primary" toolpause0.2 aftertext "Primary turn complete."`,
+		Type: "prompt",
+		Data: `ws bash "printf primary" toolpause0.2 aftertext "Primary turn complete."`,
 	}); err != nil {
 		t.Fatalf("failed to send primary prompt: %v", err)
 	}
@@ -862,15 +989,14 @@ func TestWorkspaceTopicInjectDuringActiveTurn(t *testing.T) {
 	}
 
 	var (
-		acceptedSeen  bool
-		deliveredSeen bool
-		injectedSeen  bool
-		textSeen      bool
-		doneSeen      bool
-		injectID      string
+		acceptedSeen   bool
+		injectedSeen   bool
+		textSeen       bool
+		completedSeen  bool
+		activeRunID    string
 	)
 
-	for !(acceptedSeen && deliveredSeen && injectedSeen && textSeen && doneSeen) {
+	for !(acceptedSeen && injectedSeen && textSeen && completedSeen) {
 		msg := readWorkspaceWSMessage(t, ctx, conn)
 		switch msg.Type {
 		case "inject_status":
@@ -878,23 +1004,19 @@ func TestWorkspaceTopicInjectDuringActiveTurn(t *testing.T) {
 				if msg.InjectID == "" {
 					t.Fatal("expected server-assigned injectId on accepted inject_status")
 				}
-				injectID = msg.InjectID
+				activeRunID = msg.RunID
 				acceptedSeen = true
 			}
-			if injectID != "" && msg.InjectID == injectID && msg.Status == "delivered" {
-				deliveredSeen = true
-			}
-		case "user":
-			if msg.Data == `ws text "Injected guidance acknowledged."` {
+		case "message":
+			if msg.Role == "user" && msg.RunID == activeRunID && msg.Text == `ws text "Injected guidance acknowledged."` {
 				injectedSeen = true
 			}
-		case "text":
-			if msg.Data == "Injected guidance acknowledged." {
+			if msg.Role == "assistant" && msg.RunID == activeRunID && msg.Text == "Injected guidance acknowledged." {
 				textSeen = true
 			}
-		case "done":
-			if msg.Status == "completed" {
-				doneSeen = true
+		case "run_updated":
+			if msg.RunID == activeRunID && msg.State == string(PromptStatusCompleted) {
+				completedSeen = true
 			}
 		}
 	}
@@ -953,7 +1075,7 @@ func TestWorkspaceTopicInjectRESTConflictWhenIdle(t *testing.T) {
 	if err := json.NewDecoder(injectResp.Body).Decode(&rejected); err != nil {
 		t.Fatalf("failed to decode inject rejection: %v", err)
 	}
-	if rejected.Status != "rejected" || rejected.Reason != "no_active_turn" {
+	if rejected.Status != "rejected" || rejected.Reason != "no_active_run" {
 		t.Fatalf("unexpected inject rejection %#v", rejected)
 	}
 }
@@ -995,9 +1117,8 @@ func TestWorkspaceTopicInjectDoesNotAckBeforePersistence(t *testing.T) {
 	waitForConnectedMessage(t, ctx, conn)
 
 	if err := wsjson.Write(ctx, conn, workspacePromptMessage{
-		Type:     "prompt",
-		PromptID: "p-1",
-		Data:     `ws bash "printf primary" toolpause0.2 aftertext "Primary turn complete."`,
+		Type: "prompt",
+		Data: `ws bash "printf primary" toolpause0.2 aftertext "Primary turn complete."`,
 	}); err != nil {
 		t.Fatalf("failed to send primary prompt: %v", err)
 	}
@@ -1097,17 +1218,16 @@ func TestWorkspaceTopicInterruptRESTAndQueueDrain(t *testing.T) {
 		t.Fatalf("expected 200 from interrupt, got %d: %s", interruptResp.StatusCode, string(body))
 	}
 
-	var doneEvent workspaceWSMessage
-	if err := json.NewDecoder(interruptResp.Body).Decode(&doneEvent); err != nil {
+	var interruptStatus workspaceWSMessage
+	if err := json.NewDecoder(interruptResp.Body).Decode(&interruptStatus); err != nil {
 		t.Fatalf("failed to decode interrupt response: %v", err)
 	}
-	if doneEvent.PromptID != firstPromptID || doneEvent.Status != "interrupted" || doneEvent.Reason != "Wrong approach." {
-		t.Fatalf("unexpected interrupt response %#v", doneEvent)
+	if interruptStatus.RunID != firstPromptID || interruptStatus.Type != "interrupt_status" || interruptStatus.Status != "accepted" {
+		t.Fatalf("unexpected interrupt response %#v", interruptStatus)
 	}
 
 	var (
 		cancelledSeen   bool
-		interruptedSeen bool
 		secondStarted   bool
 		secondDone      bool
 	)
@@ -1115,28 +1235,21 @@ func TestWorkspaceTopicInterruptRESTAndQueueDrain(t *testing.T) {
 	for !secondDone {
 		msg := readWorkspaceWSMessage(t, ctx, conn)
 		switch msg.Type {
-		case "prompt_status":
-			if msg.PromptID == firstPromptID && msg.Status == string(PromptStatusCancelled) {
+		case "run_updated":
+			if msg.RunID == firstPromptID && msg.State == string(PromptStatusCancelled) {
 				cancelledSeen = true
 			}
-			if msg.PromptID == secondPromptID && msg.Status == string(PromptStatusStarted) {
+			if msg.RunID == secondPromptID && msg.State == "running" {
 				secondStarted = true
 			}
-		case "done":
-			if msg.Status == "interrupted" {
-				interruptedSeen = true
-			}
-			if msg.Status == "completed" {
+			if msg.RunID == secondPromptID && msg.State == string(PromptStatusCompleted) {
 				secondDone = true
 			}
 		}
 	}
 
 	if !cancelledSeen {
-		t.Fatal("expected interrupted prompt to emit cancelled prompt_status")
-	}
-	if !interruptedSeen {
-		t.Fatal("expected interrupted done event on websocket")
+		t.Fatal("expected interrupted prompt to emit cancelled run_updated")
 	}
 	if !secondStarted {
 		t.Fatal("expected next queued prompt to start after interrupt")
@@ -1176,11 +1289,11 @@ func TestWorkspaceTopicWSReplaysRecentMessagesOnConnect(t *testing.T) {
 		t.Fatalf("failed to send prompt: %v", err)
 	}
 
-	var doneSeen bool
-	for !doneSeen {
+	var completedRunID string
+	for completedRunID == "" {
 		msg := readWorkspaceWSMessage(t, ctx, conn)
-		if msg.Type == "done" {
-			doneSeen = true
+		if msg.Type == "run_updated" && msg.State == string(PromptStatusCompleted) {
+			completedRunID = msg.RunID
 		}
 	}
 
@@ -1193,18 +1306,25 @@ func TestWorkspaceTopicWSReplaysRecentMessagesOnConnect(t *testing.T) {
 	waitForConnectedMessage(t, ctx, replayConn)
 
 	var (
-		replayedText bool
-		replayedDone bool
+		replayedUser      bool
+		replayedAssistant bool
 	)
-	for !(replayedText && replayedDone) {
+	for !(replayedUser && replayedAssistant) {
 		msg := readWorkspaceWSMessage(t, ctx, replayConn)
 		switch msg.Type {
-		case "text":
-			if msg.Data == "replay-me" {
-				replayedText = true
+		case "message":
+			if !msg.Replay {
+				continue
 			}
-		case "done":
-			replayedDone = true
+			if msg.RunID != completedRunID {
+				continue
+			}
+			if msg.Role == "user" && msg.Text == "echo: replay-me" {
+				replayedUser = true
+			}
+			if msg.Role == "assistant" && msg.Text == "replay-me" {
+				replayedAssistant = true
+			}
 		}
 	}
 }
@@ -1328,21 +1448,24 @@ func TestWorkspaceTopicAPIChatUsesTopicQueue(t *testing.T) {
 	}
 
 	var (
-		doneSeen bool
-		textSeen bool
-		userSeen bool
+		completedSeen bool
+		textSeen      bool
+		userSeen      bool
 	)
-	for !doneSeen {
+	for !completedSeen {
 		msg := readWorkspaceWSMessage(t, ctx, conn)
 		switch msg.Type {
-		case "user":
-			if msg.Data == "echo: from api" {
+		case "message":
+			if msg.Role == "user" && msg.Text == "echo: from api" {
 				userSeen = true
 			}
-		case "text":
-			textSeen = true
-		case "done":
-			doneSeen = true
+			if msg.Role == "assistant" && msg.Text != "" {
+				textSeen = true
+			}
+		case "run_updated":
+			if msg.State == string(PromptStatusCompleted) {
+				completedSeen = true
+			}
 		}
 	}
 
@@ -1396,9 +1519,8 @@ func TestWorkspaceTopicToolOutputStaysOnToolUpdate(t *testing.T) {
 	waitForConnectedMessage(t, ctx, conn)
 
 	if err := wsjson.Write(ctx, conn, workspacePromptMessage{
-		Type:     "prompt",
-		PromptID: "p-tool-1",
-		Data:     `ws bash "printf validator-output" toolpause0.1 aftertext "Validator finished."`,
+		Type: "prompt",
+		Data: `ws bash "printf validator-output" toolpause0.1 aftertext "Validator finished."`,
 	}); err != nil {
 		t.Fatalf("failed to send prompt: %v", err)
 	}
@@ -1425,15 +1547,18 @@ func TestWorkspaceTopicToolOutputStaysOnToolUpdate(t *testing.T) {
 				}
 				toolUpdateSeen = true
 			}
-		case "text":
-			if msg.Data == "validator-output" {
+		case "message":
+			if msg.Role != "assistant" {
+				continue
+			}
+			if msg.Text == "validator-output" {
 				toolOutputLeaked = true
 			}
-			if msg.Data == "Validator finished." {
+			if msg.Text == "Validator finished." {
 				afterTextSeen = true
 			}
-		case "done":
-			if msg.Status == "completed" {
+		case "run_updated":
+			if msg.State == string(PromptStatusCompleted) {
 				doneSeen = true
 			}
 		}
@@ -1445,7 +1570,7 @@ func TestWorkspaceTopicToolOutputStaysOnToolUpdate(t *testing.T) {
 }
 
 func TestWorkspaceTopicWSReplaysUserMessagesOnConnect(t *testing.T) {
-	server, database, _ := newTestServer(t)
+	server, database, predictable := newTestServer(t)
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
 	httpServer := httptest.NewServer(mux)
@@ -1488,6 +1613,10 @@ func TestWorkspaceTopicWSReplaysUserMessagesOnConnect(t *testing.T) {
 		t.Fatalf("expected 202 from api chat, got %d", chatResp.StatusCode)
 	}
 
+	waitFor(t, 2*time.Second, func() bool {
+		return predictable.GetLastRequest() != nil
+	})
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -1503,7 +1632,7 @@ func TestWorkspaceTopicWSReplaysUserMessagesOnConnect(t *testing.T) {
 	var replayedUser bool
 	for !replayedUser {
 		msg := readWorkspaceWSMessage(t, ctx, conn)
-		if msg.Type == "user" && msg.Data == "echo: replay me" {
+		if msg.Type == "message" && msg.Replay && msg.Role == "user" && msg.Text == "echo: replay me" {
 			replayedUser = true
 		}
 	}
@@ -1670,7 +1799,7 @@ func TestEmitWorkspaceWSMessagesTranslatesToolLifecycle(t *testing.T) {
 	}
 	assistantRawStr := string(assistantRaw)
 
-	messages, turnComplete := translateWorkspaceWSMessagesForAPIMessage(translator, APIMessage{
+	messages, _, turnComplete := translateWorkspaceWSMessagesForAPIMessage(translator, APIMessage{
 		Type:    string(dbpkg.MessageTypeAgent),
 		LlmData: &assistantRawStr,
 	})
@@ -1703,7 +1832,7 @@ func TestEmitWorkspaceWSMessagesTranslatesToolLifecycle(t *testing.T) {
 	}
 	toolRawStr := string(toolRaw)
 
-	messages, turnComplete = translateWorkspaceWSMessagesForAPIMessage(translator, APIMessage{
+	messages, _, turnComplete = translateWorkspaceWSMessagesForAPIMessage(translator, APIMessage{
 		Type:    string(dbpkg.MessageTypeUser),
 		LlmData: &toolRawStr,
 	})
@@ -1749,13 +1878,13 @@ func sendWorkspacePromptAndWaitAccepted(t *testing.T, ctx context.Context, conn 
 	}
 	for {
 		msg := readWorkspaceWSMessage(t, ctx, conn)
-		if msg.Type != "prompt_status" || msg.Status != string(PromptStatusAccepted) || msg.Data != data {
+		if msg.Type != "run_updated" || (msg.State != string(PromptStatusQueued) && msg.State != "running") || msg.Text != data {
 			continue
 		}
-		if msg.PromptID == "" {
-			t.Fatalf("expected accepted prompt %q to include promptId", data)
+		if msg.RunID == "" {
+			t.Fatalf("expected accepted run %q to include runId", data)
 		}
-		return msg.PromptID
+		return msg.RunID
 	}
 }
 
@@ -1779,9 +1908,9 @@ func forceStaleActivePrompt(t *testing.T, topic *Topic, promptID, text, subject 
 	topic.turnDone = make(chan struct{})
 	topic.turnMu.Unlock()
 
-	topic.turnStatusMu.Lock()
-	topic.pendingTurnStatus[promptID] = "completed"
-	topic.turnStatusMu.Unlock()
+	topic.runOutcomeMu.Lock()
+	topic.pendingRunOutcome[promptID] = workspaceDoneUserData{Status: "completed"}
+	topic.runOutcomeMu.Unlock()
 
 	topic.Manager.SetAgentWorking(false)
 }
@@ -1842,6 +1971,25 @@ func getWorkspaceTopicInfo(t *testing.T, url string) workspaceTopicInfo {
 	return info
 }
 
+func getWorkspaceTopicState(t *testing.T, url string) workspaceTopicState {
+	t.Helper()
+
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatalf("failed to fetch topic state: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 from topic state, got %d", resp.StatusCode)
+	}
+
+	var state workspaceTopicState
+	if err := json.NewDecoder(resp.Body).Decode(&state); err != nil {
+		t.Fatalf("failed to decode topic state: %v", err)
+	}
+	return state
+}
+
 func lastUserText(req *llm.Request) string {
 	if req == nil {
 		return ""
@@ -1898,9 +2046,9 @@ func waitForSSEText(ctx context.Context, events <-chan StreamResponse, text stri
 			return false
 		case event := <-events:
 			for _, msg := range event.Messages {
-				translated, _ := translateWorkspaceWSMessagesForAPIMessage(translator, msg)
+				translated, _, _ := translateWorkspaceWSMessagesForAPIMessage(translator, msg)
 				for _, translatedMsg := range translated {
-					if translatedMsg.Type == "text" && translatedMsg.Data == text {
+					if translatedMsg.Type == "message" && translatedMsg.Role == "assistant" && translatedMsg.Text == text {
 						return true
 					}
 				}

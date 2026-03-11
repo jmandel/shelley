@@ -39,10 +39,11 @@ type PromptQueueSnapshot struct {
 }
 
 type PromptQueue struct {
-	mu     sync.Mutex
-	active *QueuedPrompt
-	queue  []QueuedPrompt
-	notify chan struct{}
+	mu         sync.Mutex
+	active     *QueuedPrompt
+	activeReady bool
+	queue      []QueuedPrompt
+	notify     chan struct{}
 }
 
 func NewPromptQueue() *PromptQueue {
@@ -52,45 +53,55 @@ func NewPromptQueue() *PromptQueue {
 	}
 }
 
-func (pq *PromptQueue) Enqueue(prompt QueuedPrompt) int {
+func (pq *PromptQueue) Submit(prompt QueuedPrompt, front bool, startIfIdle bool) (QueuedPrompt, bool, int) {
 	pq.mu.Lock()
 	defer pq.mu.Unlock()
 
+	if startIfIdle && pq.active == nil && len(pq.queue) == 0 {
+		prompt.Status = PromptStatusStarted
+		pq.active = &prompt
+		pq.activeReady = true
+		select {
+		case pq.notify <- struct{}{}:
+		default:
+		}
+		return prompt, true, 0
+	}
+
 	prompt.Status = PromptStatusQueued
-	pq.queue = append(pq.queue, prompt)
-	position := len(pq.queue)
+	if front {
+		pq.queue = append([]QueuedPrompt{prompt}, pq.queue...)
+	} else {
+		pq.queue = append(pq.queue, prompt)
+	}
+	position := 1
+	if !front {
+		position = len(pq.queue)
+	}
 
 	select {
 	case pq.notify <- struct{}{}:
 	default:
 	}
 
-	return position
-}
-
-func (pq *PromptQueue) EnqueueFront(prompt QueuedPrompt) int {
-	pq.mu.Lock()
-	defer pq.mu.Unlock()
-
-	prompt.Status = PromptStatusQueued
-	pq.queue = append([]QueuedPrompt{prompt}, pq.queue...)
-
-	select {
-	case pq.notify <- struct{}{}:
-	default:
-	}
-
-	return 1
+	return prompt, false, position
 }
 
 func (pq *PromptQueue) WaitForNext(ctx context.Context) (QueuedPrompt, bool) {
 	for {
 		pq.mu.Lock()
+		if pq.active != nil && pq.activeReady {
+			next := *pq.active
+			pq.activeReady = false
+			pq.mu.Unlock()
+			return next, true
+		}
 		if pq.active == nil && len(pq.queue) > 0 {
 			next := pq.queue[0]
 			pq.queue = pq.queue[1:]
 			next.Status = PromptStatusStarted
 			pq.active = &next
+			pq.activeReady = false
 			pq.mu.Unlock()
 			return next, true
 		}
@@ -114,6 +125,7 @@ func (pq *PromptQueue) CompleteActive(status PromptStatus) (QueuedPrompt, bool) 
 	completed := *pq.active
 	completed.Status = status
 	pq.active = nil
+	pq.activeReady = false
 
 	select {
 	case pq.notify <- struct{}{}:

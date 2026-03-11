@@ -770,7 +770,7 @@ func TestWorkspaceToolApprovalResponseLogsApproved(t *testing.T) {
 
 	for {
 		msg := readWorkspaceWSMessage(t, ctx, conn)
-		if msg.Type == "done" {
+		if msg.Type == "run_updated" && msg.State == string(PromptStatusCompleted) {
 			break
 		}
 	}

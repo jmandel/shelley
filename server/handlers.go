@@ -664,10 +664,10 @@ func (s *Server) handleChatConversation(w http.ResponseWriter, r *http.Request, 
 		} else if userEmail != "" {
 			submittedBy = workspaceSubjectRef{ID: userEmail, DisplayName: userEmail}
 		}
-		prompt := topic.EnqueuePrompt("", req.Message, submittedBy, nil)
+		run := topic.EnqueuePrompt("", req.Message, submittedBy, nil)
 
 		w.WriteHeader(http.StatusAccepted)
-		json.NewEncoder(w).Encode(map[string]string{"status": "accepted", "promptId": prompt.PromptID})
+		json.NewEncoder(w).Encode(map[string]string{"status": "accepted", "runId": run.PromptID})
 		return
 	}
 
