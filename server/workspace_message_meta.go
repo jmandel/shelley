@@ -7,6 +7,7 @@ const (
 )
 
 type workspacePromptUserData struct {
+	PromptID    string               `json:"promptId,omitempty"`
 	SubmittedBy *workspaceSubjectRef `json:"submittedBy,omitempty"`
 }
 

@@ -2,11 +2,13 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"sync"
 	"time"
 
+	dbpkg "shelley.exe.dev/db"
 	"shelley.exe.dev/db/generated"
 	"shelley.exe.dev/llm"
 )
@@ -59,6 +61,14 @@ type TopicManager struct {
 	topicsByConversationID map[string]*Topic
 	server                 *Server
 	logger                 *slog.Logger
+}
+
+type topicTurnState struct {
+	activePrompt    QueuedPrompt
+	hasActivePrompt bool
+	managerWorking  bool
+	turnInFlight    bool
+	queuedCount     int
 }
 
 func NewTopicManager(server *Server, logger *slog.Logger) *TopicManager {
@@ -212,10 +222,8 @@ func (t *Topic) ClientCount() int {
 }
 
 func (t *Topic) IsBusy() bool {
-	t.turnMu.Lock()
-	turnActive := t.turnDone != nil
-	t.turnMu.Unlock()
-	return turnActive || t.Manager.IsAgentWorking() || t.PromptQueue.Len() > 0 || t.PromptQueue.ActivePromptID() != ""
+	state := t.currentTurnState("busy_check")
+	return state.turnInFlight || state.managerWorking || state.queuedCount > 0 || state.hasActivePrompt
 }
 
 func (t *Topic) EnqueuePrompt(promptID, text string, submittedBy workspaceSubjectRef, position *int) QueuedPrompt {
@@ -328,6 +336,7 @@ func (t *Topic) drainPrompts() {
 		}
 
 		userData := workspacePromptUserData{
+			PromptID:    prompt.PromptID,
 			SubmittedBy: workspaceParticipantRef(prompt.SubmittedBy),
 		}
 		if _, err := t.Manager.AcceptUserMessageWithMetadata(t.runtimeCtx, llmService, modelID, userMessage, userData, nil); err != nil {
@@ -343,9 +352,14 @@ func (t *Topic) drainPrompts() {
 }
 
 func (t *Topic) QueueSnapshot() workspaceQueueSnapshot {
+	state := t.currentTurnState("queue_snapshot")
 	snapshot := t.PromptQueue.Snapshot()
+	activePromptID := ""
+	if state.hasActivePrompt {
+		activePromptID = state.activePrompt.PromptID
+	}
 	resp := workspaceQueueSnapshot{
-		ActivePromptID: t.PromptQueue.ActivePromptID(),
+		ActivePromptID: activePromptID,
 		Entries:        make([]workspaceQueueEntry, 0, len(snapshot.Entries)),
 	}
 	for i, prompt := range snapshot.Entries {
@@ -510,25 +524,23 @@ func (t *Topic) waitForTurnEnd(waitCh <-chan struct{}) bool {
 }
 
 func (t *Topic) HasActiveTurn() bool {
-	if !t.Manager.IsAgentWorking() {
-		return false
-	}
-	_, ok := t.PromptQueue.Active()
-	return ok
+	state := t.currentTurnState("has_active_turn")
+	return state.managerWorking && state.hasActivePrompt
 }
 
 func (t *Topic) InjectMessage(injectID, text string, submittedBy workspaceSubjectRef) (workspaceWSMessage, error) {
-	activePrompt, ok := t.PromptQueue.Active()
-	if !ok || !t.Manager.IsAgentWorking() {
+	state := t.currentTurnState("inject")
+	if !state.hasActivePrompt || !state.managerWorking {
 		return workspaceWSMessage{
 			Type:        "inject_status",
 			InjectID:    injectID,
-			PromptID:    activePrompt.PromptID,
+			PromptID:    state.activePrompt.PromptID,
 			Status:      "rejected",
 			Reason:      "no_active_turn",
 			SubmittedBy: workspaceParticipantRef(submittedBy),
 		}, fmt.Errorf("no active turn")
 	}
+	activePrompt := state.activePrompt
 	if injectID == "" {
 		injectID = t.nextInjectID()
 	}
@@ -577,10 +589,11 @@ func (t *Topic) InjectMessage(injectID, text string, submittedBy workspaceSubjec
 }
 
 func (t *Topic) InterruptTurn(reason string, interruptedBy workspaceSubjectRef) (workspaceWSMessage, error) {
-	activePrompt, ok := t.PromptQueue.Active()
-	if !ok || !t.Manager.IsAgentWorking() {
+	state := t.currentTurnState("interrupt")
+	if !state.hasActivePrompt || !state.managerWorking {
 		return workspaceWSMessage{}, fmt.Errorf("no active turn")
 	}
+	activePrompt := state.activePrompt
 	t.rememberPendingTurnStatus(activePrompt.PromptID, "interrupted")
 
 	doneMeta := workspaceDoneUserData{
@@ -605,6 +618,102 @@ func (t *Topic) nextPromptID() string {
 	defer t.metaMu.Unlock()
 	t.promptSeq++
 	return fmt.Sprintf("p_%s_%d", t.Conversation.ConversationID, t.promptSeq)
+}
+
+func (t *Topic) currentTurnState(source string) topicTurnState {
+	t.reconcileStaleActivePrompt(source)
+
+	activePrompt, hasActivePrompt := t.PromptQueue.Active()
+
+	t.turnMu.Lock()
+	turnInFlight := t.turnDone != nil
+	t.turnMu.Unlock()
+
+	return topicTurnState{
+		activePrompt:    activePrompt,
+		hasActivePrompt: hasActivePrompt,
+		managerWorking:  t.Manager.IsAgentWorking(),
+		turnInFlight:    turnInFlight,
+		queuedCount:     t.PromptQueue.Len(),
+	}
+}
+
+func (t *Topic) reconcileStaleActivePrompt(source string) {
+	activePrompt, hasActivePrompt := t.PromptQueue.Active()
+	if !hasActivePrompt || t.Manager.IsAgentWorking() {
+		return
+	}
+
+	doneStatus, ok := t.staleTurnStatus(activePrompt.PromptID)
+	if !ok {
+		return
+	}
+	t.logger.Warn(
+		"reconciling stale active prompt",
+		"source", source,
+		"topic", t.Name,
+		"conversationID", t.Conversation.ConversationID,
+		"promptID", activePrompt.PromptID,
+		"status", doneStatus,
+	)
+	t.completeTurn(doneStatus)
+}
+
+func (t *Topic) staleTurnStatus(promptID string) (string, bool) {
+	if status := t.consumePendingTurnStatus(promptID); status != "" {
+		return status, true
+	}
+
+	messages, err := t.server.db.ListMessages(context.Background(), t.Conversation.ConversationID)
+	if err != nil || len(messages) == 0 {
+		return "", false
+	}
+
+	var promptUserSeq int64
+	for i := len(messages) - 1; i >= 0; i-- {
+		msg := messages[i]
+		if msg.Type != string(dbpkg.MessageTypeUser) {
+			continue
+		}
+		promptMeta, ok := parseWorkspacePromptUserData(msg.UserData)
+		if ok && promptMeta.PromptID == promptID {
+			promptUserSeq = msg.SequenceID
+			break
+		}
+	}
+	if promptUserSeq == 0 {
+		return "", false
+	}
+
+	latest := messages[len(messages)-1]
+	if latest.SequenceID <= promptUserSeq {
+		return "", false
+	}
+
+	if latest.Type == string(dbpkg.MessageTypeError) {
+		return "failed", true
+	}
+
+	doneMeta, hasDoneMeta := parseWorkspaceDoneUserData(latest.UserData)
+	if hasDoneMeta && doneMeta.Status != "" {
+		return doneMeta.Status, true
+	}
+
+	if latest.LlmData == nil {
+		return "", false
+	}
+
+	var llmMsg llm.Message
+	if err := json.Unmarshal([]byte(*latest.LlmData), &llmMsg); err != nil {
+		return "", false
+	}
+	if !llmMsg.EndOfTurn {
+		return "", false
+	}
+	if llmMessageText(llmMsg) == "[Operation cancelled]" {
+		return "cancelled", true
+	}
+	return "completed", true
 }
 
 func (t *Topic) nextInjectID() string {

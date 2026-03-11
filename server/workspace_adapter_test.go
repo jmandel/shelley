@@ -274,6 +274,127 @@ func TestWorkspaceTopicsUseConfiguredWorkspaceRoot(t *testing.T) {
 	}
 }
 
+func TestWorkspaceTopicQueueSnapshotReconcilesStaleActivePrompt(t *testing.T) {
+	server, _, _ := newTestServer(t)
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	topic, _, err := server.topicManager.GetOrCreateTopic(context.Background(), "stale-queue")
+	if err != nil {
+		t.Fatalf("failed to create stale queue topic: %v", err)
+	}
+	forceStaleActivePrompt(t, topic, "p_stale_queue", "echo: stale queue", "cli-a")
+
+	req, err := http.NewRequest(http.MethodGet, httpServer.URL+"/ws/topics/stale-queue/queue", nil)
+	if err != nil {
+		t.Fatalf("failed to build queue snapshot request: %v", err)
+	}
+	setWorkspaceAuth(t, req, "cli-a")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("failed to get queue snapshot: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200 from queue snapshot, got %d: %s", resp.StatusCode, string(body))
+	}
+
+	var snapshot workspaceQueueSnapshot
+	if err := json.NewDecoder(resp.Body).Decode(&snapshot); err != nil {
+		t.Fatalf("failed to decode reconciled queue snapshot: %v", err)
+	}
+	if snapshot.ActivePromptID != "" {
+		t.Fatalf("expected stale active prompt to be cleared, got %#v", snapshot)
+	}
+	if topic.PromptQueue.ActivePromptID() != "" {
+		t.Fatalf("expected in-memory prompt queue to be reconciled, got active %q", topic.PromptQueue.ActivePromptID())
+	}
+	if topic.IsBusy() {
+		t.Fatal("expected reconciled topic to report not busy")
+	}
+}
+
+func TestWorkspaceTopicsListReconcilesStaleBusyState(t *testing.T) {
+	server, _, _ := newTestServer(t)
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	topic, _, err := server.topicManager.GetOrCreateTopic(context.Background(), "stale-busy")
+	if err != nil {
+		t.Fatalf("failed to create stale busy topic: %v", err)
+	}
+	forceStaleActivePrompt(t, topic, "p_stale_busy", "echo: stale busy", "cli-a")
+
+	resp, err := http.Get(httpServer.URL + "/ws/topics")
+	if err != nil {
+		t.Fatalf("failed to list topics: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200 from topic list, got %d: %s", resp.StatusCode, string(body))
+	}
+
+	var topics []workspaceTopicInfo
+	if err := json.NewDecoder(resp.Body).Decode(&topics); err != nil {
+		t.Fatalf("failed to decode topic list: %v", err)
+	}
+	if len(topics) != 1 {
+		t.Fatalf("expected one topic, got %#v", topics)
+	}
+	if topics[0].Busy {
+		t.Fatalf("expected stale busy topic to be reconciled, got %#v", topics[0])
+	}
+	if topic.PromptQueue.ActivePromptID() != "" {
+		t.Fatalf("expected busy reconciliation to clear active prompt, got %q", topic.PromptQueue.ActivePromptID())
+	}
+}
+
+func TestWorkspaceTopicInterruptReconcilesStaleActivePrompt(t *testing.T) {
+	server, _, _ := newTestServer(t)
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	topic, _, err := server.topicManager.GetOrCreateTopic(context.Background(), "stale-interrupt")
+	if err != nil {
+		t.Fatalf("failed to create stale interrupt topic: %v", err)
+	}
+	forceStaleActivePrompt(t, topic, "p_stale_interrupt", "echo: stale interrupt", "cli-a")
+
+	req, err := http.NewRequest(http.MethodPost, httpServer.URL+"/ws/topics/stale-interrupt/interrupt", bytes.NewBufferString(`{"reason":"Wrong approach."}`))
+	if err != nil {
+		t.Fatalf("failed to build interrupt request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	setWorkspaceAuth(t, req, "cli-a")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("failed to post interrupt request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 409 from interrupt against stale active prompt, got %d: %s", resp.StatusCode, string(body))
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "no active turn") {
+		t.Fatalf("expected stale interrupt response to say no active turn, got %q", string(body))
+	}
+	if topic.PromptQueue.ActivePromptID() != "" {
+		t.Fatalf("expected stale interrupt reconciliation to clear active prompt, got %q", topic.PromptQueue.ActivePromptID())
+	}
+	if topic.IsBusy() {
+		t.Fatal("expected stale interrupt reconciliation to leave topic idle")
+	}
+}
+
 func TestWorkspaceTopicsDoNotListLegacyConversation(t *testing.T) {
 	server, database, _ := newTestServer(t)
 	slug := "legacy-conversation"
@@ -1636,6 +1757,33 @@ func sendWorkspacePromptAndWaitAccepted(t *testing.T, ctx context.Context, conn 
 		}
 		return msg.PromptID
 	}
+}
+
+func forceStaleActivePrompt(t *testing.T, topic *Topic, promptID, text, subject string) {
+	t.Helper()
+
+	topic.PromptQueue.mu.Lock()
+	topic.PromptQueue.active = &QueuedPrompt{
+		PromptID: promptID,
+		Text:     text,
+		SubmittedBy: workspaceSubjectRef{
+			ID:          subject,
+			DisplayName: subject,
+		},
+		QueuedAt: time.Now().UTC(),
+		Status:   PromptStatusStarted,
+	}
+	topic.PromptQueue.mu.Unlock()
+
+	topic.turnMu.Lock()
+	topic.turnDone = make(chan struct{})
+	topic.turnMu.Unlock()
+
+	topic.turnStatusMu.Lock()
+	topic.pendingTurnStatus[promptID] = "completed"
+	topic.turnStatusMu.Unlock()
+
+	topic.Manager.SetAgentWorking(false)
 }
 
 func workspaceAuthDialOptions(t *testing.T, subject string) *websocket.DialOptions {
