@@ -24,11 +24,10 @@ import (
 
 type workspaceTopicInfo struct {
 	Name      string `json:"name"`
-	SessionID string `json:"sessionId"`
 	Clients   int    `json:"clients"`
 	Busy      bool   `json:"busy"`
 	LogSize   int64  `json:"logSize"`
-	ACP       string `json:"acp"`
+	Events    string `json:"events,omitempty"`
 	CreatedAt string `json:"createdAt"`
 }
 
@@ -40,7 +39,6 @@ type workspaceWSMessage struct {
 	Type            string                `json:"type"`
 	Data            string                `json:"data,omitempty"`
 	Topic           string                `json:"topic,omitempty"`
-	SessionID       string                `json:"sessionId,omitempty"`
 	ProtocolVersion string                `json:"protocolVersion,omitempty"`
 	Replay          bool                  `json:"replay,omitempty"`
 	EventID         string                `json:"eventId,omitempty"`
@@ -81,8 +79,8 @@ type workspacePromptMessage struct {
 }
 
 type workspaceSubjectRef struct {
-	Kind string `json:"kind"`
-	ID   string `json:"id"`
+	ID          string `json:"id"`
+	DisplayName string `json:"displayName,omitempty"`
 }
 
 type workspaceQueueEntry struct {
@@ -95,7 +93,6 @@ type workspaceQueueEntry struct {
 }
 
 type workspaceQueueSnapshot struct {
-	SessionID      string                `json:"sessionId"`
 	ActivePromptID string                `json:"activePromptId,omitempty"`
 	Entries        []workspaceQueueEntry `json:"entries"`
 }
@@ -118,14 +115,6 @@ type workspaceInjectRequest struct {
 
 type workspaceInterruptRequest struct {
 	Reason string `json:"reason"`
-}
-
-type workspaceManagerInfo struct {
-	Name      string `json:"name"`
-	Status    string `json:"status"`
-	ACP       string `json:"acp"`
-	API       string `json:"api,omitempty"`
-	CreatedAt string `json:"createdAt"`
 }
 
 type topicConversationState int
@@ -157,69 +146,6 @@ func (s *Server) handleWorkspaceHealth(w http.ResponseWriter, r *http.Request) {
 		"hasApiKey":     s.defaultTopicModelID() != "",
 		"topics":        topics,
 	})
-}
-
-func (s *Server) handleWorkspaceManager(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode([]workspaceManagerInfo{s.workspaceManagerInfo(r)})
-	case http.MethodPost:
-		var req struct {
-			Name   string   `json:"name"`
-			Topics []string `json:"topics"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Invalid JSON", http.StatusBadRequest)
-			return
-		}
-		if req.Name == "" {
-			http.Error(w, "name required", http.StatusBadRequest)
-			return
-		}
-		if req.Name != s.workspaceName {
-			http.Error(w, "single-workspace server: name does not match running workspace", http.StatusConflict)
-			return
-		}
-		for _, topic := range req.Topics {
-			topicName, err := sanitizeTopicName(topic)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
-				return
-			}
-			if _, _, err := s.topicManager.GetOrCreateTopic(r.Context(), topicName); err != nil {
-				s.logger.Error("Failed to pre-create topic from workspace manager request", "topic", topicName, "error", err)
-				http.Error(w, "Internal server error", http.StatusInternalServerError)
-				return
-			}
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusCreated)
-		resp := s.workspaceManagerInfo(r)
-		type workspaceCreateResponse struct {
-			workspaceManagerInfo
-			Topics []string `json:"topics,omitempty"`
-		}
-		json.NewEncoder(w).Encode(workspaceCreateResponse{
-			workspaceManagerInfo: resp,
-			Topics:               req.Topics,
-		})
-	default:
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-	}
-}
-
-func (s *Server) handleWorkspaceManagerWorkspace(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	if r.PathValue("name") != s.workspaceName {
-		http.Error(w, "not found", http.StatusNotFound)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(s.workspaceManagerInfo(r))
 }
 
 func (s *Server) handleWorkspaceTopics(w http.ResponseWriter, r *http.Request) {
@@ -352,28 +278,22 @@ func (s *Server) handleWorkspaceTopic(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) handleWorkspaceTopicQueryWS(w http.ResponseWriter, r *http.Request) {
-	topicName := r.URL.Query().Get("session")
-	if topicName == "" {
-		topicName = r.URL.Query().Get("topic")
-	}
-	if topicName == "" {
-		topicName = "general"
-	}
-	s.handleWorkspaceTopicWSForName(w, r, topicName)
-}
-
 func (s *Server) handleWorkspaceTopicWSByName(w http.ResponseWriter, r *http.Request) {
 	s.handleWorkspaceTopicWSForName(w, r, r.PathValue("name"))
-}
-
-func (s *Server) handleWorkspaceTopicWS(w http.ResponseWriter, r *http.Request) {
-	s.handleWorkspaceTopicWSForName(w, r, r.PathValue("topic"))
 }
 
 func (s *Server) handleWorkspaceTopicWSForName(w http.ResponseWriter, r *http.Request, rawTopicName string) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	principal, ok, err := s.workspacePrincipalFromRequest(r)
+	if err != nil {
+		http.Error(w, "invalid authorization token", http.StatusUnauthorized)
+		return
+	}
+	if !ok {
+		http.Error(w, "authorization required", http.StatusUnauthorized)
 		return
 	}
 
@@ -404,6 +324,17 @@ func (s *Server) handleWorkspaceTopicWSForName(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	connectionID := fmt.Sprintf("%s-%d", topicName, time.Now().UnixNano())
+	submittedBy := workspaceSubjectFromPrincipal(principal)
+	topic.WSHub.Add(connectionID, outCh, cancel)
+	defer topic.WSHub.Remove(connectionID)
+
+	topic.sendWSMessage(ctx, outCh, workspaceWSMessage{
+		Type:            "connected",
+		Topic:           topicName,
+		ProtocolVersion: workspaceProtocolVersion,
+		Replay:          true,
+	})
 	if state == topicConversationCreated {
 		go s.publishConversationListUpdate(ConversationListUpdate{
 			Type:         "update",
@@ -418,22 +349,6 @@ func (s *Server) handleWorkspaceTopicWSForName(w http.ResponseWriter, r *http.Re
 		})
 		topic.sendWSMessage(ctx, outCh, workspaceWSMessage{Type: "system", Data: "restoring archived topic..."})
 	}
-
-	connectionID := fmt.Sprintf("%s-%d", topicName, time.Now().UnixNano())
-	senderID := workspaceRequesterID(r)
-	if senderID == "" {
-		senderID = connectionID
-	}
-	topic.WSHub.Add(connectionID, outCh, cancel)
-	defer topic.WSHub.Remove(connectionID)
-
-	topic.sendWSMessage(ctx, outCh, workspaceWSMessage{
-		Type:            "connected",
-		Topic:           topicName,
-		SessionID:       topic.Conversation.ConversationID,
-		ProtocolVersion: workspaceProtocolVersion,
-		Replay:          true,
-	})
 	replayMessages, err := s.replayWorkspaceTopicMessages(ctx, topic.Conversation.ConversationID)
 	if err != nil {
 		topic.sendWSMessage(ctx, outCh, workspaceWSMessage{Type: "error", Data: "failed to replay topic history"})
@@ -467,30 +382,24 @@ func (s *Server) handleWorkspaceTopicWSForName(w http.ResponseWriter, r *http.Re
 			}
 			if msg.Position != nil && *msg.Position != 0 {
 				topic.sendWSMessage(ctx, outCh, workspaceWSMessage{
-					Type:     "error",
-					PromptID: msg.PromptID,
-					Data:     "position must be 0 when provided",
+					Type: "error",
+					Data: "position must be 0 when provided",
 				})
 				continue
 			}
-			topic.EnqueuePrompt(msg.PromptID, prompt, senderID, msg.Position)
+			topic.EnqueuePrompt("", prompt, submittedBy, msg.Position)
 		case "inject":
 			injectText := strings.TrimSpace(msg.Data)
-			if msg.InjectID == "" {
-				topic.sendWSMessage(ctx, outCh, workspaceWSMessage{Type: "error", Data: "injectId is required"})
-				continue
-			}
 			if injectText == "" {
 				topic.sendWSMessage(ctx, outCh, workspaceWSMessage{
-					Type:     "inject_status",
-					InjectID: msg.InjectID,
-					Status:   "rejected",
-					Reason:   "empty_inject",
+					Type:   "inject_status",
+					Status: "rejected",
+					Reason: "empty_inject",
 				})
 				topic.sendWSMessage(ctx, outCh, workspaceWSMessage{Type: "error", Data: "data is required"})
 				continue
 			}
-			if rejected, err := topic.InjectMessage(msg.InjectID, injectText, senderID); err != nil {
+			if rejected, err := topic.InjectMessage("", injectText, submittedBy); err != nil {
 				if rejected.Type != "" {
 					topic.sendWSMessage(ctx, outCh, rejected)
 				}
@@ -502,7 +411,7 @@ func (s *Server) handleWorkspaceTopicWSForName(w http.ResponseWriter, r *http.Re
 				topic.sendWSMessage(ctx, outCh, workspaceWSMessage{Type: "error", Data: "reason is required"})
 				continue
 			}
-			if _, err := topic.InterruptTurn(reason, senderID); err != nil {
+			if _, err := topic.InterruptTurn(reason, submittedBy); err != nil {
 				topic.sendWSMessage(ctx, outCh, workspaceWSMessage{Type: "error", Data: err.Error()})
 			}
 		case "cancel_prompt":
@@ -510,11 +419,11 @@ func (s *Server) handleWorkspaceTopicWSForName(w http.ResponseWriter, r *http.Re
 				topic.sendWSMessage(ctx, outCh, workspaceWSMessage{Type: "error", Data: "promptId is required"})
 				continue
 			}
-			if err := topic.CancelQueuedPrompt(msg.PromptID, senderID); err != nil {
+			if err := topic.CancelQueuedPrompt(msg.PromptID, submittedBy.ID); err != nil {
 				topic.sendWSMessage(ctx, outCh, workspaceWSMessage{Type: "error", PromptID: msg.PromptID, Data: err.Error()})
 			}
 		case "clear_my_prompts":
-			removed := topic.ClearQueuedPromptsForSender(senderID)
+			removed := topic.ClearQueuedPromptsForSender(submittedBy.ID)
 			topic.sendWSMessage(ctx, outCh, workspaceWSMessage{
 				Type:    "queue_cleared",
 				Removed: removed,
@@ -526,7 +435,7 @@ func (s *Server) handleWorkspaceTopicWSForName(w http.ResponseWriter, r *http.Re
 			topic.ResolveApprovalResponse(workspaceApprovalResponse{
 				ToolCallID: msg.ToolCallID,
 				Approved:   msg.Approved,
-				Approver:   strings.TrimSpace(msg.Approver),
+				Approver:   workspaceApprovalActor(submittedBy, strings.TrimSpace(msg.Approver)),
 			})
 		}
 	}
@@ -579,7 +488,11 @@ func (s *Server) handleWorkspaceTopicQueueEntry(w http.ResponseWriter, r *http.R
 
 	switch r.Method {
 	case http.MethodDelete:
-		if err := topic.CancelQueuedPrompt(promptID, workspaceRequesterID(r)); err != nil {
+		principal, ok := s.requireWorkspacePrincipal(w, r)
+		if !ok {
+			return
+		}
+		if err := topic.CancelQueuedPrompt(promptID, principal.Subject); err != nil {
 			writeWorkspaceQueueMutationError(w, err)
 			return
 		}
@@ -595,7 +508,11 @@ func (s *Server) handleWorkspaceTopicQueueEntry(w http.ResponseWriter, r *http.R
 			http.Error(w, "data is required", http.StatusBadRequest)
 			return
 		}
-		if err := topic.UpdateQueuedPrompt(promptID, workspaceRequesterID(r), text); err != nil {
+		principal, ok := s.requireWorkspacePrincipal(w, r)
+		if !ok {
+			return
+		}
+		if err := topic.UpdateQueuedPrompt(promptID, principal.Subject, text); err != nil {
 			writeWorkspaceQueueMutationError(w, err)
 			return
 		}
@@ -629,7 +546,12 @@ func (s *Server) handleWorkspaceTopicQueueClearMine(w http.ResponseWriter, r *ht
 		return
 	}
 
-	removed := topic.ClearQueuedPromptsForSender(workspaceRequesterID(r))
+	principal, ok := s.requireWorkspacePrincipal(w, r)
+	if !ok {
+		return
+	}
+
+	removed := topic.ClearQueuedPromptsForSender(principal.Subject)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(workspaceQueueClearResponse{Removed: removed})
 }
@@ -673,7 +595,12 @@ func (s *Server) handleWorkspaceTopicQueueMove(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	if err := topic.MoveQueuedPrompt(promptID, workspaceRequesterID(r), req.Direction); err != nil {
+	principal, ok := s.requireWorkspacePrincipal(w, r)
+	if !ok {
+		return
+	}
+
+	if err := topic.MoveQueuedPrompt(promptID, principal.Subject, req.Direction); err != nil {
 		writeWorkspaceQueueMutationError(w, err)
 		return
 	}
@@ -717,7 +644,12 @@ func (s *Server) handleWorkspaceTopicInject(w http.ResponseWriter, r *http.Reque
 	}
 
 	injectID := topic.nextInjectID()
-	accepted, err := topic.InjectMessage(injectID, req.Data, workspaceRequesterID(r))
+	principal, ok := s.requireWorkspacePrincipal(w, r)
+	if !ok {
+		return
+	}
+
+	accepted, err := topic.InjectMessage(injectID, req.Data, workspaceSubjectFromPrincipal(principal))
 	if err != nil {
 		if accepted.Status == "rejected" {
 			w.Header().Set("Content-Type", "application/json")
@@ -771,7 +703,12 @@ func (s *Server) handleWorkspaceTopicInterrupt(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	doneEvent, err := topic.InterruptTurn(req.Reason, workspaceRequesterID(r))
+	principal, ok := s.requireWorkspacePrincipal(w, r)
+	if !ok {
+		return
+	}
+
+	doneEvent, err := topic.InterruptTurn(req.Reason, workspaceSubjectFromPrincipal(principal))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
@@ -872,11 +809,10 @@ func (s *Server) workspaceTopicInfo(ctx context.Context, r *http.Request, topicN
 
 	return workspaceTopicInfo{
 		Name:      topicName,
-		SessionID: conversation.ConversationID,
 		Clients:   clients,
 		Busy:      busy,
 		LogSize:   logSize,
-		ACP:       workspaceTopicACPURL(r, topicName),
+		Events:    workspaceTopicEventsURL(r, topicName),
 		CreatedAt: createdAt.Format(time.RFC3339),
 	}, nil
 }
@@ -1288,20 +1224,9 @@ func workspaceQueueSnapshotMessage(topic *Topic) workspaceWSMessage {
 		Type:           "queue_snapshot",
 		EventID:        eventID,
 		Timestamp:      timestamp,
-		SessionID:      snapshot.SessionID,
 		ActivePromptID: snapshot.ActivePromptID,
 		Entries:        snapshot.Entries,
 	}
-}
-
-func workspaceRequesterID(r *http.Request) string {
-	if senderID := strings.TrimSpace(r.Header.Get("X-Workspace-Client-ID")); senderID != "" {
-		return senderID
-	}
-	if senderID := strings.TrimSpace(r.URL.Query().Get("client_id")); senderID != "" {
-		return senderID
-	}
-	return ""
 }
 
 func writeWorkspaceQueueMutationError(w http.ResponseWriter, err error) {
@@ -1354,38 +1279,12 @@ func sanitizeTopicName(name string) (string, error) {
 	return sanitized, nil
 }
 
-func workspaceTopicACPURL(r *http.Request, topicName string) string {
+func workspaceTopicEventsURL(r *http.Request, topicName string) string {
 	scheme := "ws"
 	if r.TLS != nil {
 		scheme = "wss"
 	}
-	return fmt.Sprintf("%s://%s/acp/%s", scheme, r.Host, url.PathEscape(topicName))
-}
-
-func workspaceCanonicalAPIBaseURL(r *http.Request) string {
-	scheme := "http"
-	if r.TLS != nil {
-		scheme = "https"
-	}
-	return fmt.Sprintf("%s://%s/ws", scheme, r.Host)
-}
-
-func workspaceLegacyACPBaseURL(r *http.Request) string {
-	scheme := "ws"
-	if r.TLS != nil {
-		scheme = "wss"
-	}
-	return fmt.Sprintf("%s://%s/acp", scheme, r.Host)
-}
-
-func (s *Server) workspaceManagerInfo(r *http.Request) workspaceManagerInfo {
-	return workspaceManagerInfo{
-		Name:      s.workspaceName,
-		Status:    "running",
-		ACP:       workspaceLegacyACPBaseURL(r),
-		API:       workspaceCanonicalAPIBaseURL(r),
-		CreatedAt: s.startedAt.Format(time.RFC3339),
-	}
+	return fmt.Sprintf("%s://%s/ws/topics/%s/events", scheme, r.Host, url.PathEscape(topicName))
 }
 
 func defaultWorkspaceName() string {

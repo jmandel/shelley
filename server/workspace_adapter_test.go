@@ -55,12 +55,13 @@ func TestWorkspaceTopicsLifecycle(t *testing.T) {
 	if created.Name != "debug-timeout" {
 		t.Fatalf("expected sanitized topic name, got %q", created.Name)
 	}
-	if created.SessionID == "" {
-		t.Fatal("expected session id in create response")
+	if !strings.HasSuffix(created.Events, "/ws/topics/debug-timeout/events") {
+		t.Fatalf("expected topic events URL, got %q", created.Events)
 	}
 	if _, err := time.Parse(time.RFC3339, created.CreatedAt); err != nil {
 		t.Fatalf("expected RFC3339 createdAt, got %q: %v", created.CreatedAt, err)
 	}
+	createdConversationID := conversationIDForTopic(t, database, "debug-timeout")
 
 	topicResp, err := http.Get(httpServer.URL + "/ws/topics/debug-timeout")
 	if err != nil {
@@ -75,8 +76,8 @@ func TestWorkspaceTopicsLifecycle(t *testing.T) {
 	if err := json.NewDecoder(topicResp.Body).Decode(&fetched); err != nil {
 		t.Fatalf("failed to decode topic response: %v", err)
 	}
-	if fetched.SessionID != created.SessionID {
-		t.Fatalf("expected session id %q, got %q", created.SessionID, fetched.SessionID)
+	if fetched.Events != created.Events {
+		t.Fatalf("expected events URL %q, got %q", created.Events, fetched.Events)
 	}
 	if fetched.Clients != 0 {
 		t.Fatalf("expected 0 clients before websocket connect, got %d", fetched.Clients)
@@ -140,8 +141,9 @@ func TestWorkspaceTopicsLifecycle(t *testing.T) {
 	if err := json.NewDecoder(recreateResp.Body).Decode(&recreated); err != nil {
 		t.Fatalf("failed to decode recreate response: %v", err)
 	}
-	if recreated.SessionID != created.SessionID {
-		t.Fatalf("expected recreate to unarchive existing topic %q, got %q", created.SessionID, recreated.SessionID)
+	recreatedConversationID := conversationIDForTopic(t, database, "debug-timeout")
+	if recreatedConversationID != createdConversationID {
+		t.Fatalf("expected recreate to unarchive existing topic %q, got %q", createdConversationID, recreatedConversationID)
 	}
 
 	conversation, err := database.GetConversationBySlug(context.Background(), "debug-timeout")
@@ -153,7 +155,7 @@ func TestWorkspaceTopicsLifecycle(t *testing.T) {
 	}
 }
 
-func TestWorkspaceAliasRoutesAndManagerDiscovery(t *testing.T) {
+func TestWorkspaceCompatibilityRoutes(t *testing.T) {
 	server, _, _ := newTestServer(t)
 	server.workspaceName = "test-workspace"
 
@@ -202,69 +204,6 @@ func TestWorkspaceAliasRoutesAndManagerDiscovery(t *testing.T) {
 		t.Fatalf("expected alias-topic in /ws/health topics, got %#v", health.Topics)
 	}
 
-	listResp, err := http.Get(httpServer.URL + "/workspaces")
-	if err != nil {
-		t.Fatalf("failed to call /workspaces: %v", err)
-	}
-	defer listResp.Body.Close()
-	if listResp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200 from /workspaces, got %d", listResp.StatusCode)
-	}
-
-	var workspaces []workspaceManagerInfo
-	if err := json.NewDecoder(listResp.Body).Decode(&workspaces); err != nil {
-		t.Fatalf("failed to decode /workspaces response: %v", err)
-	}
-	if len(workspaces) != 1 || workspaces[0].Name != "test-workspace" {
-		t.Fatalf("unexpected /workspaces response: %#v", workspaces)
-	}
-	if !strings.HasSuffix(workspaces[0].API, "/ws") {
-		t.Fatalf("expected manager api base URL to end with /ws, got %q", workspaces[0].API)
-	}
-	if !strings.HasSuffix(workspaces[0].ACP, "/acp") {
-		t.Fatalf("expected manager acp base URL to end with /acp, got %q", workspaces[0].ACP)
-	}
-
-	getResp, err := http.Get(httpServer.URL + "/workspaces/test-workspace")
-	if err != nil {
-		t.Fatalf("failed to call /workspaces/{name}: %v", err)
-	}
-	defer getResp.Body.Close()
-	if getResp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200 from /workspaces/{name}, got %d", getResp.StatusCode)
-	}
-
-	var workspace workspaceManagerInfo
-	if err := json.NewDecoder(getResp.Body).Decode(&workspace); err != nil {
-		t.Fatalf("failed to decode /workspaces/{name} response: %v", err)
-	}
-	if workspace.Name != "test-workspace" {
-		t.Fatalf("unexpected workspace info: %#v", workspace)
-	}
-
-	managerCreateReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/workspaces", bytes.NewBufferString(`{"name":"test-workspace","topics":["precreated"]}`))
-	if err != nil {
-		t.Fatalf("failed to build manager create request: %v", err)
-	}
-	managerCreateReq.Header.Set("Content-Type", "application/json")
-	managerCreateResp, err := http.DefaultClient.Do(managerCreateReq)
-	if err != nil {
-		t.Fatalf("failed to post /workspaces: %v", err)
-	}
-	defer managerCreateResp.Body.Close()
-	if managerCreateResp.StatusCode != http.StatusCreated {
-		t.Fatalf("expected 201 from /workspaces POST, got %d", managerCreateResp.StatusCode)
-	}
-
-	precreatedResp, err := http.Get(httpServer.URL + "/ws/topics/precreated")
-	if err != nil {
-		t.Fatalf("failed to get precreated topic: %v", err)
-	}
-	defer precreatedResp.Body.Close()
-	if precreatedResp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200 for precreated topic, got %d", precreatedResp.StatusCode)
-	}
-
 	rootTopicsResp, err := http.Get(httpServer.URL + "/topics")
 	if err != nil {
 		t.Fatalf("failed to call root /topics compatibility route: %v", err)
@@ -272,6 +211,25 @@ func TestWorkspaceAliasRoutesAndManagerDiscovery(t *testing.T) {
 	defer rootTopicsResp.Body.Close()
 	if rootTopicsResp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200 from root /topics compatibility route, got %d", rootTopicsResp.StatusCode)
+	}
+
+	notFoundPaths := []string{
+		"/workspaces",
+		"/workspaces/test-workspace",
+		"/acp",
+		"/acp/alias-topic",
+		"/ws/acp",
+		"/ws/acp/alias-topic",
+	}
+	for _, path := range notFoundPaths {
+		resp, err := http.Get(httpServer.URL + path)
+		if err != nil {
+			t.Fatalf("failed to call %s: %v", path, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("expected 404 from %s, got %d", path, resp.StatusCode)
+		}
 	}
 }
 
@@ -307,7 +265,7 @@ func TestWorkspaceTopicsUseConfiguredWorkspaceRoot(t *testing.T) {
 		t.Fatalf("failed to decode rooted topic response: %v", err)
 	}
 
-	conversation, err := database.GetConversationByID(context.Background(), created.SessionID)
+	conversation, err := database.GetConversationBySlug(context.Background(), created.Name)
 	if err != nil {
 		t.Fatalf("failed to load rooted conversation: %v", err)
 	}
@@ -358,8 +316,8 @@ func TestWorkspaceTopicWSQueuesPrompt(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws/topic/general"
-	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws/topics/general/events"
+	conn, _, err := websocket.Dial(ctx, wsURL, workspaceAuthDialOptions(t, "viewer"))
 	if err != nil {
 		t.Fatalf("failed to dial websocket: %v", err)
 	}
@@ -367,10 +325,10 @@ func TestWorkspaceTopicWSQueuesPrompt(t *testing.T) {
 
 	waitForConnectedMessage(t, ctx, conn)
 
-	if err := wsjson.Write(ctx, conn, workspacePromptMessage{Type: "prompt", PromptID: "p-first", Data: "echo: first"}); err != nil {
+	if err := wsjson.Write(ctx, conn, workspacePromptMessage{Type: "prompt", Data: "echo: first"}); err != nil {
 		t.Fatalf("failed to send first prompt: %v", err)
 	}
-	if err := wsjson.Write(ctx, conn, workspacePromptMessage{Type: "prompt", PromptID: "p-second", Data: "echo: second"}); err != nil {
+	if err := wsjson.Write(ctx, conn, workspacePromptMessage{Type: "prompt", Data: "echo: second"}); err != nil {
 		t.Fatalf("failed to send second prompt: %v", err)
 	}
 
@@ -380,20 +338,28 @@ func TestWorkspaceTopicWSQueuesPrompt(t *testing.T) {
 	}
 
 	var (
-		queuedSeen  bool
-		startedSeen bool
-		texts       []string
-		doneCount   int
+		firstPromptID  string
+		secondPromptID string
+		queuedSeen     bool
+		startedSeen    bool
+		texts          []string
+		doneCount      int
 	)
 
-	for doneCount < 2 {
+	for doneCount < 2 || firstPromptID == "" || secondPromptID == "" {
 		msg := readWorkspaceWSMessage(t, ctx, conn)
 		switch msg.Type {
 		case "prompt_status":
-			if msg.PromptID == "p-second" && msg.Status == string(PromptStatusQueued) {
+			if msg.Status == string(PromptStatusAccepted) && msg.Data == "echo: first" {
+				firstPromptID = msg.PromptID
+			}
+			if msg.Status == string(PromptStatusAccepted) && msg.Data == "echo: second" {
+				secondPromptID = msg.PromptID
+			}
+			if msg.PromptID == secondPromptID && msg.Status == string(PromptStatusQueued) {
 				queuedSeen = true
 			}
-			if msg.PromptID == "p-first" && msg.Status == string(PromptStatusStarted) {
+			if msg.PromptID == firstPromptID && msg.Status == string(PromptStatusStarted) {
 				startedSeen = true
 			}
 		case "text":
@@ -441,20 +407,15 @@ func TestWorkspaceTopicQueueRESTAndCancellation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws/topic/queue-rest?client_id=cli-a"
-	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(httpServer.URL, "http")+"/ws/topics/queue-rest/events", workspaceAuthDialOptions(t, "cli-a"))
 	if err != nil {
 		t.Fatalf("failed to dial websocket: %v", err)
 	}
 	defer conn.Close(websocket.StatusNormalClosure, "test complete")
 	waitForConnectedMessage(t, ctx, conn)
 
-	if err := wsjson.Write(ctx, conn, workspacePromptMessage{Type: "prompt", PromptID: "p-1", Data: "echo: first"}); err != nil {
-		t.Fatalf("failed to send first prompt: %v", err)
-	}
-	if err := wsjson.Write(ctx, conn, workspacePromptMessage{Type: "prompt", PromptID: "p-2", Data: "echo: second"}); err != nil {
-		t.Fatalf("failed to send second prompt: %v", err)
-	}
+	firstPromptID := sendWorkspacePromptAndWaitAccepted(t, ctx, conn, "echo: first", nil)
+	secondPromptID := sendWorkspacePromptAndWaitAccepted(t, ctx, conn, "echo: second", nil)
 
 	waitFor(t, 2*time.Second, func() bool {
 		req, err := http.NewRequest(http.MethodGet, httpServer.URL+"/ws/topics/queue-rest/queue", nil)
@@ -470,14 +431,14 @@ func TestWorkspaceTopicQueueRESTAndCancellation(t *testing.T) {
 		if err := json.NewDecoder(resp.Body).Decode(&snapshot); err != nil {
 			return false
 		}
-		return snapshot.ActivePromptID == "p-1" && len(snapshot.Entries) == 1 && snapshot.Entries[0].PromptID == "p-2"
+		return snapshot.ActivePromptID == firstPromptID && len(snapshot.Entries) == 1 && snapshot.Entries[0].PromptID == secondPromptID
 	})
 
-	cancelReq, err := http.NewRequest(http.MethodDelete, httpServer.URL+"/ws/topics/queue-rest/queue/p-2", nil)
+	cancelReq, err := http.NewRequest(http.MethodDelete, httpServer.URL+"/ws/topics/queue-rest/queue/"+secondPromptID, nil)
 	if err != nil {
 		t.Fatalf("failed to build queue delete request: %v", err)
 	}
-	cancelReq.Header.Set("X-Workspace-Client-ID", "cli-a")
+	setWorkspaceAuth(t, cancelReq, "cli-a")
 	cancelResp, err := http.DefaultClient.Do(cancelReq)
 	if err != nil {
 		t.Fatalf("failed to delete queued prompt: %v", err)
@@ -490,7 +451,7 @@ func TestWorkspaceTopicQueueRESTAndCancellation(t *testing.T) {
 	var cancelledSeen bool
 	for !cancelledSeen {
 		msg := readWorkspaceWSMessage(t, ctx, conn)
-		if msg.Type == "prompt_status" && msg.PromptID == "p-2" && msg.Status == string(PromptStatusCancelled) {
+		if msg.Type == "prompt_status" && msg.PromptID == secondPromptID && msg.Status == string(PromptStatusCancelled) {
 			cancelledSeen = true
 		}
 	}
@@ -508,23 +469,16 @@ func TestWorkspaceTopicQueueRESTUpdateAndMove(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws/topic/queue-edit?client_id=cli-a"
-	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(httpServer.URL, "http")+"/ws/topics/queue-edit/events", workspaceAuthDialOptions(t, "cli-a"))
 	if err != nil {
 		t.Fatalf("failed to dial websocket: %v", err)
 	}
 	defer conn.Close(websocket.StatusNormalClosure, "test complete")
 	waitForConnectedMessage(t, ctx, conn)
 
-	for _, prompt := range []workspacePromptMessage{
-		{Type: "prompt", PromptID: "p-1", Data: "echo: first"},
-		{Type: "prompt", PromptID: "p-2", Data: "echo: second"},
-		{Type: "prompt", PromptID: "p-3", Data: "echo: third"},
-	} {
-		if err := wsjson.Write(ctx, conn, prompt); err != nil {
-			t.Fatalf("failed to enqueue %s: %v", prompt.PromptID, err)
-		}
-	}
+	firstPromptID := sendWorkspacePromptAndWaitAccepted(t, ctx, conn, "echo: first", nil)
+	secondPromptID := sendWorkspacePromptAndWaitAccepted(t, ctx, conn, "echo: second", nil)
+	thirdPromptID := sendWorkspacePromptAndWaitAccepted(t, ctx, conn, "echo: third", nil)
 
 	waitFor(t, 2*time.Second, func() bool {
 		req, err := http.NewRequest(http.MethodGet, httpServer.URL+"/ws/topics/queue-edit/queue", nil)
@@ -540,21 +494,38 @@ func TestWorkspaceTopicQueueRESTUpdateAndMove(t *testing.T) {
 		if err := json.NewDecoder(resp.Body).Decode(&snapshot); err != nil {
 			return false
 		}
-		return snapshot.ActivePromptID == "p-1" &&
+		return snapshot.ActivePromptID == firstPromptID &&
 			len(snapshot.Entries) == 2 &&
-			snapshot.Entries[0].PromptID == "p-2" &&
-			snapshot.Entries[1].PromptID == "p-3"
+			snapshot.Entries[0].PromptID == secondPromptID &&
+			snapshot.Entries[1].PromptID == thirdPromptID
 	})
 
-	updateReq, err := http.NewRequest(http.MethodPatch, httpServer.URL+"/ws/topics/queue-edit/queue/p-3", bytes.NewBufferString(`{"data":"echo: revised third"}`))
+	updateReq, err := http.NewRequest(http.MethodPatch, httpServer.URL+"/ws/topics/queue-edit/queue/"+thirdPromptID, bytes.NewBufferString(`{"data":"echo: revised third"}`))
 	if err != nil {
 		t.Fatalf("failed to build queue patch request: %v", err)
 	}
 	updateReq.Header.Set("Content-Type", "application/json")
-	updateReq.Header.Set("X-Workspace-Client-ID", "cli-b")
+	setWorkspaceAuth(t, updateReq, "cli-b")
 	updateResp, err := http.DefaultClient.Do(updateReq)
 	if err != nil {
 		t.Fatalf("failed to patch queued prompt: %v", err)
+	}
+	if updateResp.StatusCode != http.StatusForbidden {
+		body, _ := io.ReadAll(updateResp.Body)
+		updateResp.Body.Close()
+		t.Fatalf("expected 403 from queue patch for non-owner, got %d: %s", updateResp.StatusCode, string(body))
+	}
+	updateResp.Body.Close()
+
+	updateReq, err = http.NewRequest(http.MethodPatch, httpServer.URL+"/ws/topics/queue-edit/queue/"+thirdPromptID, bytes.NewBufferString(`{"data":"echo: revised third"}`))
+	if err != nil {
+		t.Fatalf("failed to build owner queue patch request: %v", err)
+	}
+	updateReq.Header.Set("Content-Type", "application/json")
+	setWorkspaceAuth(t, updateReq, "cli-a")
+	updateResp, err = http.DefaultClient.Do(updateReq)
+	if err != nil {
+		t.Fatalf("failed to patch queued prompt as owner: %v", err)
 	}
 	if updateResp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(updateResp.Body)
@@ -574,20 +545,37 @@ func TestWorkspaceTopicQueueRESTUpdateAndMove(t *testing.T) {
 	var updatedSeen bool
 	for !updatedSeen {
 		msg := readWorkspaceWSMessage(t, ctx, conn)
-		if msg.Type == "queue_entry_updated" && msg.PromptID == "p-3" && msg.Data == "echo: revised third" {
+		if msg.Type == "queue_entry_updated" && msg.PromptID == thirdPromptID && msg.Data == "echo: revised third" {
 			updatedSeen = true
 		}
 	}
 
-	moveReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/ws/topics/queue-edit/queue/p-3/move", bytes.NewBufferString(`{"direction":"top"}`))
+	moveReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/ws/topics/queue-edit/queue/"+thirdPromptID+"/move", bytes.NewBufferString(`{"direction":"top"}`))
 	if err != nil {
 		t.Fatalf("failed to build queue move request: %v", err)
 	}
 	moveReq.Header.Set("Content-Type", "application/json")
-	moveReq.Header.Set("X-Workspace-Client-ID", "cli-b")
+	setWorkspaceAuth(t, moveReq, "cli-b")
 	moveResp, err := http.DefaultClient.Do(moveReq)
 	if err != nil {
 		t.Fatalf("failed to move queued prompt: %v", err)
+	}
+	if moveResp.StatusCode != http.StatusForbidden {
+		body, _ := io.ReadAll(moveResp.Body)
+		moveResp.Body.Close()
+		t.Fatalf("expected 403 from queue move for non-owner, got %d: %s", moveResp.StatusCode, string(body))
+	}
+	moveResp.Body.Close()
+
+	moveReq, err = http.NewRequest(http.MethodPost, httpServer.URL+"/ws/topics/queue-edit/queue/"+thirdPromptID+"/move", bytes.NewBufferString(`{"direction":"top"}`))
+	if err != nil {
+		t.Fatalf("failed to build owner queue move request: %v", err)
+	}
+	moveReq.Header.Set("Content-Type", "application/json")
+	setWorkspaceAuth(t, moveReq, "cli-a")
+	moveResp, err = http.DefaultClient.Do(moveReq)
+	if err != nil {
+		t.Fatalf("failed to move queued prompt as owner: %v", err)
 	}
 	if moveResp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(moveResp.Body)
@@ -600,24 +588,24 @@ func TestWorkspaceTopicQueueRESTUpdateAndMove(t *testing.T) {
 		t.Fatalf("failed to decode queue move response: %v", err)
 	}
 	moveResp.Body.Close()
-	if got := movedSnapshot.Entries[0].PromptID; got != "p-3" {
+	if got := movedSnapshot.Entries[0].PromptID; got != thirdPromptID {
 		t.Fatalf("expected moved prompt to be first in queue, got %q", got)
 	}
 
 	var movedSeen bool
 	for !movedSeen {
 		msg := readWorkspaceWSMessage(t, ctx, conn)
-		if msg.Type == "queue_entry_moved" && msg.PromptID == "p-3" && msg.Direction == "top" && msg.Position == 1 {
+		if msg.Type == "queue_entry_moved" && msg.PromptID == thirdPromptID && msg.Direction == "top" && msg.Position == 1 {
 			movedSeen = true
 		}
 	}
 
-	moveBottomReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/ws/topics/queue-edit/queue/p-3/move", bytes.NewBufferString(`{"direction":"bottom"}`))
+	moveBottomReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/ws/topics/queue-edit/queue/"+thirdPromptID+"/move", bytes.NewBufferString(`{"direction":"bottom"}`))
 	if err != nil {
 		t.Fatalf("failed to build queue bottom move request: %v", err)
 	}
 	moveBottomReq.Header.Set("Content-Type", "application/json")
-	moveBottomReq.Header.Set("X-Workspace-Client-ID", "cli-b")
+	setWorkspaceAuth(t, moveBottomReq, "cli-a")
 	moveBottomResp, err := http.DefaultClient.Do(moveBottomReq)
 	if err != nil {
 		t.Fatalf("failed to move queued prompt to bottom: %v", err)
@@ -633,14 +621,14 @@ func TestWorkspaceTopicQueueRESTUpdateAndMove(t *testing.T) {
 		t.Fatalf("failed to decode queue bottom move response: %v", err)
 	}
 	moveBottomResp.Body.Close()
-	if got := bottomSnapshot.Entries[len(bottomSnapshot.Entries)-1].PromptID; got != "p-3" {
+	if got := bottomSnapshot.Entries[len(bottomSnapshot.Entries)-1].PromptID; got != thirdPromptID {
 		t.Fatalf("expected moved prompt to be last in queue after bottom move, got %q", got)
 	}
 
 	var bottomSeen bool
 	for !bottomSeen {
 		msg := readWorkspaceWSMessage(t, ctx, conn)
-		if msg.Type == "queue_entry_moved" && msg.PromptID == "p-3" && msg.Direction == "bottom" && msg.Position == 2 {
+		if msg.Type == "queue_entry_moved" && msg.PromptID == thirdPromptID && msg.Direction == "bottom" && msg.Position == 2 {
 			bottomSeen = true
 		}
 	}
@@ -658,8 +646,7 @@ func TestWorkspaceTopicPromptPositionFront(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws/topic/queue-front?client_id=cli-a"
-	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(httpServer.URL, "http")+"/ws/topics/queue-front/events", workspaceAuthDialOptions(t, "cli-a"))
 	if err != nil {
 		t.Fatalf("failed to dial websocket: %v", err)
 	}
@@ -667,30 +654,20 @@ func TestWorkspaceTopicPromptPositionFront(t *testing.T) {
 	waitForConnectedMessage(t, ctx, conn)
 
 	front := 0
-	for _, prompt := range []workspacePromptMessage{
-		{Type: "prompt", PromptID: "p-1", Data: "echo: first"},
-		{Type: "prompt", PromptID: "p-2", Data: "echo: second"},
-		{Type: "prompt", PromptID: "p-3", Data: "echo: third", Position: &front},
-	} {
-		if err := wsjson.Write(ctx, conn, prompt); err != nil {
-			t.Fatalf("failed to enqueue %s: %v", prompt.PromptID, err)
-		}
-	}
+	_ = sendWorkspacePromptAndWaitAccepted(t, ctx, conn, "echo: first", nil)
+	_ = sendWorkspacePromptAndWaitAccepted(t, ctx, conn, "echo: second", nil)
+	thirdPromptID := sendWorkspacePromptAndWaitAccepted(t, ctx, conn, "echo: third", &front)
 
 	var (
-		thirdAccepted bool
-		thirdQueued   bool
-		donePrompts   []string
+		thirdQueued bool
+		donePrompts []string
 	)
 
 	for len(donePrompts) < 3 {
 		msg := readWorkspaceWSMessage(t, ctx, conn)
 		switch msg.Type {
 		case "prompt_status":
-			if msg.PromptID == "p-3" && msg.Status == string(PromptStatusAccepted) && msg.Data == "echo: third" && msg.Position == 1 {
-				thirdAccepted = true
-			}
-			if msg.PromptID == "p-3" && msg.Status == string(PromptStatusQueued) && msg.Position == 1 {
+			if msg.PromptID == thirdPromptID && msg.Status == string(PromptStatusQueued) && msg.Position == 1 {
 				thirdQueued = true
 			}
 		case "done":
@@ -698,9 +675,6 @@ func TestWorkspaceTopicPromptPositionFront(t *testing.T) {
 		}
 	}
 
-	if !thirdAccepted {
-		t.Fatal("expected accepted event for p-3 to include prompt text at queue position 1")
-	}
 	if !thirdQueued {
 		t.Fatal("expected p-3 to be queued at the front")
 	}
@@ -737,8 +711,7 @@ func TestWorkspaceTopicInjectDuringActiveTurn(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws/topic/inject-live?client_id=cli-a"
-	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(httpServer.URL, "http")+"/ws/topics/inject-live/events", workspaceAuthDialOptions(t, "cli-a"))
 	if err != nil {
 		t.Fatalf("failed to dial websocket: %v", err)
 	}
@@ -761,9 +734,8 @@ func TestWorkspaceTopicInjectDuringActiveTurn(t *testing.T) {
 	}
 
 	if err := wsjson.Write(ctx, conn, workspacePromptMessage{
-		Type:     "inject",
-		InjectID: "inj-1",
-		Data:     `ws text "Injected guidance acknowledged."`,
+		Type: "inject",
+		Data: `ws text "Injected guidance acknowledged."`,
 	}); err != nil {
 		t.Fatalf("failed to inject prompt: %v", err)
 	}
@@ -774,16 +746,21 @@ func TestWorkspaceTopicInjectDuringActiveTurn(t *testing.T) {
 		injectedSeen  bool
 		textSeen      bool
 		doneSeen      bool
+		injectID      string
 	)
 
 	for !(acceptedSeen && deliveredSeen && injectedSeen && textSeen && doneSeen) {
 		msg := readWorkspaceWSMessage(t, ctx, conn)
 		switch msg.Type {
 		case "inject_status":
-			if msg.InjectID == "inj-1" && msg.Status == "accepted" {
+			if msg.Status == "accepted" {
+				if msg.InjectID == "" {
+					t.Fatal("expected server-assigned injectId on accepted inject_status")
+				}
+				injectID = msg.InjectID
 				acceptedSeen = true
 			}
-			if msg.InjectID == "inj-1" && msg.Status == "delivered" {
+			if injectID != "" && msg.InjectID == injectID && msg.Status == "delivered" {
 				deliveredSeen = true
 			}
 		case "user":
@@ -840,7 +817,7 @@ func TestWorkspaceTopicInjectRESTConflictWhenIdle(t *testing.T) {
 		t.Fatalf("failed to build inject request: %v", err)
 	}
 	injectReq.Header.Set("Content-Type", "application/json")
-	injectReq.Header.Set("X-Workspace-Client-ID", "cli-a")
+	setWorkspaceAuth(t, injectReq, "cli-a")
 	injectResp, err := http.DefaultClient.Do(injectReq)
 	if err != nil {
 		t.Fatalf("failed to post inject request: %v", err)
@@ -889,8 +866,7 @@ func TestWorkspaceTopicInjectDoesNotAckBeforePersistence(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws/topic/inject-persist-fail?client_id=cli-a"
-	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(httpServer.URL, "http")+"/ws/topics/inject-persist-fail/events", workspaceAuthDialOptions(t, "cli-a"))
 	if err != nil {
 		t.Fatalf("failed to dial websocket: %v", err)
 	}
@@ -917,9 +893,8 @@ func TestWorkspaceTopicInjectDoesNotAckBeforePersistence(t *testing.T) {
 	}
 
 	if err := wsjson.Write(ctx, conn, workspacePromptMessage{
-		Type:     "inject",
-		InjectID: "inj-fail",
-		Data:     `ws text "should never be delivered"`,
+		Type: "inject",
+		Data: `ws text "should never be delivered"`,
 	}); err != nil {
 		t.Fatalf("failed to inject prompt: %v", err)
 	}
@@ -931,13 +906,13 @@ func TestWorkspaceTopicInjectDoesNotAckBeforePersistence(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		msg := readWorkspaceWSMessage(t, ctx, conn)
-		if msg.InjectID != "inj-fail" {
-			continue
-		}
 		if msg.Type == "inject_status" && msg.Status == "accepted" {
 			acceptedSeen = true
 		}
 		if msg.Type == "inject_status" && msg.Status == "rejected" && msg.Reason == "inject_failed" {
+			if msg.InjectID == "" {
+				t.Fatal("expected server-assigned injectId on rejected inject_status")
+			}
 			rejectedSeen = true
 			break
 		}
@@ -968,22 +943,15 @@ func TestWorkspaceTopicInterruptRESTAndQueueDrain(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws/topic/interrupt-rest?client_id=cli-a"
-	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(httpServer.URL, "http")+"/ws/topics/interrupt-rest/events", workspaceAuthDialOptions(t, "cli-a"))
 	if err != nil {
 		t.Fatalf("failed to dial websocket: %v", err)
 	}
 	defer conn.Close(websocket.StatusNormalClosure, "test complete")
 	waitForConnectedMessage(t, ctx, conn)
 
-	for _, prompt := range []workspacePromptMessage{
-		{Type: "prompt", PromptID: "p-1", Data: `ws bash "printf slow" toolpause0.2 aftertext "Primary turn complete."`},
-		{Type: "prompt", PromptID: "p-2", Data: "echo: second"},
-	} {
-		if err := wsjson.Write(ctx, conn, prompt); err != nil {
-			t.Fatalf("failed to send prompt %s: %v", prompt.PromptID, err)
-		}
-	}
+	firstPromptID := sendWorkspacePromptAndWaitAccepted(t, ctx, conn, `ws bash "printf slow" toolpause0.2 aftertext "Primary turn complete."`, nil)
+	secondPromptID := sendWorkspacePromptAndWaitAccepted(t, ctx, conn, "echo: second", nil)
 
 	for {
 		msg := readWorkspaceWSMessage(t, ctx, conn)
@@ -997,7 +965,7 @@ func TestWorkspaceTopicInterruptRESTAndQueueDrain(t *testing.T) {
 		t.Fatalf("failed to build interrupt request: %v", err)
 	}
 	interruptReq.Header.Set("Content-Type", "application/json")
-	interruptReq.Header.Set("X-Workspace-Client-ID", "cli-a")
+	setWorkspaceAuth(t, interruptReq, "cli-a")
 	interruptResp, err := http.DefaultClient.Do(interruptReq)
 	if err != nil {
 		t.Fatalf("failed to post interrupt request: %v", err)
@@ -1012,7 +980,7 @@ func TestWorkspaceTopicInterruptRESTAndQueueDrain(t *testing.T) {
 	if err := json.NewDecoder(interruptResp.Body).Decode(&doneEvent); err != nil {
 		t.Fatalf("failed to decode interrupt response: %v", err)
 	}
-	if doneEvent.PromptID != "p-1" || doneEvent.Status != "interrupted" || doneEvent.Reason != "Wrong approach." {
+	if doneEvent.PromptID != firstPromptID || doneEvent.Status != "interrupted" || doneEvent.Reason != "Wrong approach." {
 		t.Fatalf("unexpected interrupt response %#v", doneEvent)
 	}
 
@@ -1027,10 +995,10 @@ func TestWorkspaceTopicInterruptRESTAndQueueDrain(t *testing.T) {
 		msg := readWorkspaceWSMessage(t, ctx, conn)
 		switch msg.Type {
 		case "prompt_status":
-			if msg.PromptID == "p-1" && msg.Status == string(PromptStatusCancelled) {
+			if msg.PromptID == firstPromptID && msg.Status == string(PromptStatusCancelled) {
 				cancelledSeen = true
 			}
-			if msg.PromptID == "p-2" && msg.Status == string(PromptStatusStarted) {
+			if msg.PromptID == secondPromptID && msg.Status == string(PromptStatusStarted) {
 				secondStarted = true
 			}
 		case "done":
@@ -1075,8 +1043,8 @@ func TestWorkspaceTopicWSReplaysRecentMessagesOnConnect(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws/topic/general"
-	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws/topics/general/events"
+	conn, _, err := websocket.Dial(ctx, wsURL, workspaceAuthDialOptions(t, "viewer"))
 	if err != nil {
 		t.Fatalf("failed to dial websocket: %v", err)
 	}
@@ -1095,7 +1063,7 @@ func TestWorkspaceTopicWSReplaysRecentMessagesOnConnect(t *testing.T) {
 		}
 	}
 
-	replayConn, _, err := websocket.Dial(ctx, wsURL, nil)
+	replayConn, _, err := websocket.Dial(ctx, wsURL, workspaceAuthDialOptions(t, "replay-viewer"))
 	if err != nil {
 		t.Fatalf("failed to dial replay websocket: %v", err)
 	}
@@ -1121,7 +1089,7 @@ func TestWorkspaceTopicWSReplaysRecentMessagesOnConnect(t *testing.T) {
 }
 
 func TestWorkspaceTopicWSPromptBroadcastsToSSE(t *testing.T) {
-	server, _, _ := newTestServer(t)
+	server, database, _ := newTestServer(t)
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
 	httpServer := httptest.NewServer(mux)
@@ -1146,8 +1114,9 @@ func TestWorkspaceTopicWSPromptBroadcastsToSSE(t *testing.T) {
 	if err := json.NewDecoder(createResp.Body).Decode(&created); err != nil {
 		t.Fatalf("failed to decode create response: %v", err)
 	}
+	conversationID := conversationIDForTopic(t, database, created.Name)
 
-	sseResp, err := http.Get(httpServer.URL + "/api/conversation/" + created.SessionID + "/stream")
+	sseResp, err := http.Get(httpServer.URL + "/api/conversation/" + conversationID + "/stream")
 	if err != nil {
 		t.Fatalf("failed to open sse stream: %v", err)
 	}
@@ -1162,8 +1131,8 @@ func TestWorkspaceTopicWSPromptBroadcastsToSSE(t *testing.T) {
 	streamEvents := make(chan StreamResponse, 32)
 	go collectSSEStreamResponses(ctx, sseResp.Body, streamEvents)
 
-	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws/topic/sse-collab"
-	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws/topics/sse-collab/events"
+	conn, _, err := websocket.Dial(ctx, wsURL, workspaceAuthDialOptions(t, "sse-viewer"))
 	if err != nil {
 		t.Fatalf("failed to dial websocket: %v", err)
 	}
@@ -1182,7 +1151,7 @@ func TestWorkspaceTopicWSPromptBroadcastsToSSE(t *testing.T) {
 func TestWorkspaceTopicAPIChatUsesTopicQueue(t *testing.T) {
 	t.Setenv("PREDICTABLE_DELAY_MS", "250")
 
-	server, _, predictable := newTestServer(t)
+	server, database, predictable := newTestServer(t)
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
 	httpServer := httptest.NewServer(mux)
@@ -1207,12 +1176,13 @@ func TestWorkspaceTopicAPIChatUsesTopicQueue(t *testing.T) {
 	if err := json.NewDecoder(createResp.Body).Decode(&created); err != nil {
 		t.Fatalf("failed to decode create response: %v", err)
 	}
+	conversationID := conversationIDForTopic(t, database, created.Name)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws/topic/shared-api"
-	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws/topics/shared-api/events"
+	conn, _, err := websocket.Dial(ctx, wsURL, workspaceAuthDialOptions(t, "api-viewer"))
 	if err != nil {
 		t.Fatalf("failed to dial websocket: %v", err)
 	}
@@ -1221,7 +1191,7 @@ func TestWorkspaceTopicAPIChatUsesTopicQueue(t *testing.T) {
 	waitForConnectedMessage(t, ctx, conn)
 
 	chatReqBody := bytes.NewBufferString(`{"message":"echo: from api","model":"predictable"}`)
-	chatReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/api/conversation/"+created.SessionID+"/chat", chatReqBody)
+	chatReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/api/conversation/"+conversationID+"/chat", chatReqBody)
 	if err != nil {
 		t.Fatalf("failed to build chat request: %v", err)
 	}
@@ -1297,8 +1267,7 @@ func TestWorkspaceTopicToolOutputStaysOnToolUpdate(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws/topic/tool-output?client_id=cli-a"
-	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(httpServer.URL, "http")+"/ws/topics/tool-output/events", workspaceAuthDialOptions(t, "cli-a"))
 	if err != nil {
 		t.Fatalf("failed to dial websocket: %v", err)
 	}
@@ -1355,7 +1324,7 @@ func TestWorkspaceTopicToolOutputStaysOnToolUpdate(t *testing.T) {
 }
 
 func TestWorkspaceTopicWSReplaysUserMessagesOnConnect(t *testing.T) {
-	server, _, _ := newTestServer(t)
+	server, database, _ := newTestServer(t)
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
 	httpServer := httptest.NewServer(mux)
@@ -1380,9 +1349,10 @@ func TestWorkspaceTopicWSReplaysUserMessagesOnConnect(t *testing.T) {
 	if err := json.NewDecoder(createResp.Body).Decode(&created); err != nil {
 		t.Fatalf("failed to decode create response: %v", err)
 	}
+	conversationID := conversationIDForTopic(t, database, created.Name)
 
 	chatReqBody := bytes.NewBufferString(`{"message":"echo: replay me","model":"predictable"}`)
-	chatReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/api/conversation/"+created.SessionID+"/chat", chatReqBody)
+	chatReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/api/conversation/"+conversationID+"/chat", chatReqBody)
 	if err != nil {
 		t.Fatalf("failed to build chat request: %v", err)
 	}
@@ -1400,8 +1370,8 @@ func TestWorkspaceTopicWSReplaysUserMessagesOnConnect(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws/topic/user-replay"
-	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws/topics/user-replay/events"
+	conn, _, err := websocket.Dial(ctx, wsURL, workspaceAuthDialOptions(t, "replay-viewer"))
 	if err != nil {
 		t.Fatalf("failed to dial websocket: %v", err)
 	}
@@ -1446,6 +1416,7 @@ func TestWorkspaceTopicAPIChatRestoresRuntimeFromPersistedTopic(t *testing.T) {
 	if err := json.NewDecoder(createResp.Body).Decode(&created); err != nil {
 		t.Fatalf("failed to decode create response: %v", err)
 	}
+	conversationID := conversationIDForTopic(t, database, created.Name)
 
 	predictable := loop.NewPredictableService()
 	restarted := NewServer(
@@ -1459,7 +1430,7 @@ func TestWorkspaceTopicAPIChatRestoresRuntimeFromPersistedTopic(t *testing.T) {
 		"",
 		nil,
 	)
-	if restarted.topicManager.GetTopicByConversationID(created.SessionID) != nil {
+	if restarted.topicManager.GetTopicByConversationID(conversationID) != nil {
 		t.Fatal("expected restarted server to begin without an in-memory topic runtime")
 	}
 
@@ -1469,23 +1440,23 @@ func TestWorkspaceTopicAPIChatRestoresRuntimeFromPersistedTopic(t *testing.T) {
 		t.Fatalf("failed to marshal chat request: %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/api/conversation/"+created.SessionID+"/chat", bytes.NewReader(chatBody))
+	req := httptest.NewRequest(http.MethodPost, "/api/conversation/"+conversationID+"/chat", bytes.NewReader(chatBody))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 
-	restarted.handleChatConversation(w, req, created.SessionID)
+	restarted.handleChatConversation(w, req, conversationID)
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("expected 202 from restored api chat, got %d: %s", w.Code, w.Body.String())
 	}
 
 	waitFor(t, 2*time.Second, func() bool {
-		return restarted.topicManager.GetTopicByConversationID(created.SessionID) != nil
+		return restarted.topicManager.GetTopicByConversationID(conversationID) != nil
 	})
 	waitFor(t, 2*time.Second, func() bool {
 		return predictable.GetLastRequest() != nil
 	})
 
-	topic := restarted.topicManager.GetTopicByConversationID(created.SessionID)
+	topic := restarted.topicManager.GetTopicByConversationID(conversationID)
 	if topic == nil || topic.Name != "restored-runtime" {
 		t.Fatalf("expected recovered topic runtime for restored-runtime, got %#v", topic)
 	}
@@ -1495,7 +1466,7 @@ func TestWorkspaceTopicAPIChatRestoresRuntimeFromPersistedTopic(t *testing.T) {
 }
 
 func TestRenameTopicConversationKeepsWorkspaceTopicRouting(t *testing.T) {
-	server, _, _ := newTestServer(t)
+	server, database, _ := newTestServer(t)
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
 	httpServer := httptest.NewServer(mux)
@@ -1520,8 +1491,9 @@ func TestRenameTopicConversationKeepsWorkspaceTopicRouting(t *testing.T) {
 	if err := json.NewDecoder(createResp.Body).Decode(&created); err != nil {
 		t.Fatalf("failed to decode create response: %v", err)
 	}
+	conversationID := conversationIDForTopic(t, database, created.Name)
 
-	renameReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/api/conversation/"+created.SessionID+"/rename", bytes.NewBufferString(`{"slug":"renamed-topic"}`))
+	renameReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/api/conversation/"+conversationID+"/rename", bytes.NewBufferString(`{"slug":"renamed-topic"}`))
 	if err != nil {
 		t.Fatalf("failed to build rename request: %v", err)
 	}
@@ -1558,8 +1530,8 @@ func TestRenameTopicConversationKeepsWorkspaceTopicRouting(t *testing.T) {
 	if err := json.NewDecoder(newTopicResp.Body).Decode(&renamed); err != nil {
 		t.Fatalf("failed to decode renamed topic response: %v", err)
 	}
-	if renamed.SessionID != created.SessionID {
-		t.Fatalf("expected renamed topic to keep session %q, got %q", created.SessionID, renamed.SessionID)
+	if renamed.Name != "renamed-topic" {
+		t.Fatalf("expected renamed topic name, got %#v", renamed)
 	}
 }
 
@@ -1635,8 +1607,8 @@ func waitForConnectedMessage(t *testing.T, ctx context.Context, conn *websocket.
 	for {
 		msg := readWorkspaceWSMessage(t, ctx, conn)
 		if msg.Type == "connected" {
-			if msg.Topic == "" || msg.SessionID == "" {
-				t.Fatalf("expected connected message with topic and session id, got %#v", msg)
+			if msg.Topic == "" {
+				t.Fatalf("expected connected message with topic, got %#v", msg)
 			}
 			if msg.ProtocolVersion != workspaceProtocolVersion {
 				t.Fatalf("expected connected protocolVersion %q, got %#v", workspaceProtocolVersion, msg)
@@ -1647,6 +1619,48 @@ func waitForConnectedMessage(t *testing.T, ctx context.Context, conn *websocket.
 			return
 		}
 	}
+}
+
+func sendWorkspacePromptAndWaitAccepted(t *testing.T, ctx context.Context, conn *websocket.Conn, data string, position *int) string {
+	t.Helper()
+	if err := wsjson.Write(ctx, conn, workspacePromptMessage{Type: "prompt", Data: data, Position: position}); err != nil {
+		t.Fatalf("failed to send prompt %q: %v", data, err)
+	}
+	for {
+		msg := readWorkspaceWSMessage(t, ctx, conn)
+		if msg.Type != "prompt_status" || msg.Status != string(PromptStatusAccepted) || msg.Data != data {
+			continue
+		}
+		if msg.PromptID == "" {
+			t.Fatalf("expected accepted prompt %q to include promptId", data)
+		}
+		return msg.PromptID
+	}
+}
+
+func workspaceAuthDialOptions(t *testing.T, subject string) *websocket.DialOptions {
+	t.Helper()
+	return &websocket.DialOptions{
+		HTTPHeader: http.Header{
+			workspaceHeaderSubject:     []string{subject},
+			workspaceHeaderDisplayName: []string{subject},
+		},
+	}
+}
+
+func setWorkspaceAuth(t *testing.T, req *http.Request, subject string) {
+	t.Helper()
+	req.Header.Set(workspaceHeaderSubject, subject)
+	req.Header.Set(workspaceHeaderDisplayName, subject)
+}
+
+func conversationIDForTopic(t *testing.T, database *dbpkg.DB, topicName string) string {
+	t.Helper()
+	conversation, err := database.GetConversationBySlug(context.Background(), topicName)
+	if err != nil {
+		t.Fatalf("failed to load topic conversation %q: %v", topicName, err)
+	}
+	return conversation.ConversationID
 }
 
 func readWorkspaceWSMessage(t *testing.T, ctx context.Context, conn *websocket.Conn) workspaceWSMessage {

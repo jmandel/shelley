@@ -48,9 +48,9 @@ type Topic struct {
 }
 
 type workspacePendingInject struct {
-	InjectID string
-	PromptID string
-	SenderID string
+	InjectID    string
+	PromptID    string
+	SubmittedBy workspaceSubjectRef
 }
 
 type TopicManager struct {
@@ -218,16 +218,16 @@ func (t *Topic) IsBusy() bool {
 	return turnActive || t.Manager.IsAgentWorking() || t.PromptQueue.Len() > 0 || t.PromptQueue.ActivePromptID() != ""
 }
 
-func (t *Topic) EnqueuePrompt(promptID, text, senderID string, position *int) QueuedPrompt {
+func (t *Topic) EnqueuePrompt(promptID, text string, submittedBy workspaceSubjectRef, position *int) QueuedPrompt {
 	if promptID == "" {
 		promptID = t.nextPromptID()
 	}
 	queued := t.IsBusy()
 	prompt := QueuedPrompt{
-		PromptID: promptID,
-		Text:     text,
-		SenderID: senderID,
-		QueuedAt: time.Now().UTC(),
+		PromptID:    promptID,
+		Text:        text,
+		SubmittedBy: submittedBy,
+		QueuedAt:    time.Now().UTC(),
 	}
 	queuePosition := 0
 	if position != nil && *position == 0 {
@@ -241,7 +241,7 @@ func (t *Topic) EnqueuePrompt(promptID, text, senderID string, position *int) Qu
 		Status:      string(PromptStatusAccepted),
 		Data:        prompt.Text,
 		Position:    queuePosition,
-		SubmittedBy: workspaceParticipantRef(prompt.SenderID),
+		SubmittedBy: workspaceParticipantRef(prompt.SubmittedBy),
 	})
 	if queued {
 		t.broadcastQueueEvent(workspaceWSMessage{
@@ -249,7 +249,7 @@ func (t *Topic) EnqueuePrompt(promptID, text, senderID string, position *int) Qu
 			PromptID:    prompt.PromptID,
 			Status:      string(PromptStatusQueued),
 			Position:    queuePosition,
-			SubmittedBy: workspaceParticipantRef(prompt.SenderID),
+			SubmittedBy: workspaceParticipantRef(prompt.SubmittedBy),
 		})
 	}
 	t.broadcastQueueSnapshot()
@@ -301,7 +301,7 @@ func (t *Topic) drainPrompts() {
 			Type:        "prompt_status",
 			PromptID:    prompt.PromptID,
 			Status:      string(PromptStatusStarted),
-			SubmittedBy: workspaceParticipantRef(prompt.SenderID),
+			SubmittedBy: workspaceParticipantRef(prompt.SubmittedBy),
 		})
 		t.broadcastQueueSnapshot()
 		if err := t.refreshWorkspaceTools(t.runtimeCtx); err != nil {
@@ -328,7 +328,7 @@ func (t *Topic) drainPrompts() {
 		}
 
 		userData := workspacePromptUserData{
-			SubmittedBy: workspaceParticipantRef(prompt.SenderID),
+			SubmittedBy: workspaceParticipantRef(prompt.SubmittedBy),
 		}
 		if _, err := t.Manager.AcceptUserMessageWithMetadata(t.runtimeCtx, llmService, modelID, userMessage, userData, nil); err != nil {
 			t.abortTurn()
@@ -345,7 +345,6 @@ func (t *Topic) drainPrompts() {
 func (t *Topic) QueueSnapshot() workspaceQueueSnapshot {
 	snapshot := t.PromptQueue.Snapshot()
 	resp := workspaceQueueSnapshot{
-		SessionID:      t.Conversation.ConversationID,
 		ActivePromptID: t.PromptQueue.ActivePromptID(),
 		Entries:        make([]workspaceQueueEntry, 0, len(snapshot.Entries)),
 	}
@@ -365,7 +364,7 @@ func (t *Topic) UpdateQueuedPrompt(promptID, senderID, text string) error {
 		PromptID:    updated.PromptID,
 		Data:        updated.Text,
 		Position:    position,
-		SubmittedBy: workspaceParticipantRef(updated.SenderID),
+		SubmittedBy: workspaceParticipantRef(updated.SubmittedBy),
 	})
 	t.broadcastQueueSnapshot()
 	return nil
@@ -381,7 +380,7 @@ func (t *Topic) MoveQueuedPrompt(promptID, senderID, direction string) error {
 		PromptID:    moved.PromptID,
 		Direction:   direction,
 		Position:    position,
-		SubmittedBy: workspaceParticipantRef(moved.SenderID),
+		SubmittedBy: workspaceParticipantRef(moved.SubmittedBy),
 	})
 	t.broadcastQueueSnapshot()
 	return nil
@@ -396,7 +395,7 @@ func (t *Topic) CancelQueuedPrompt(promptID, senderID string) error {
 		Type:        "prompt_status",
 		PromptID:    removed.PromptID,
 		Status:      string(PromptStatusCancelled),
-		SubmittedBy: workspaceParticipantRef(removed.SenderID),
+		SubmittedBy: workspaceParticipantRef(removed.SubmittedBy),
 	})
 	t.broadcastQueueEvent(workspaceWSMessage{
 		Type:     "queue_entry_removed",
@@ -419,7 +418,7 @@ func (t *Topic) ClearQueuedPromptsForSender(senderID string) []string {
 			Type:        "prompt_status",
 			PromptID:    prompt.PromptID,
 			Status:      string(PromptStatusCancelled),
-			SubmittedBy: workspaceParticipantRef(prompt.SenderID),
+			SubmittedBy: workspaceParticipantRef(prompt.SubmittedBy),
 		})
 		t.broadcastQueueEvent(workspaceWSMessage{
 			Type:     "queue_entry_removed",
@@ -469,7 +468,7 @@ func (t *Topic) completeTurn(doneStatus string) {
 			Type:        "prompt_status",
 			PromptID:    completed.PromptID,
 			Status:      string(status),
-			SubmittedBy: workspaceParticipantRef(completed.SenderID),
+			SubmittedBy: workspaceParticipantRef(completed.SubmittedBy),
 		})
 		t.rejectPendingInjectsForPrompt(completed.PromptID, rejectReason)
 		t.broadcastQueueSnapshot()
@@ -488,7 +487,7 @@ func (t *Topic) abortTurn() {
 			Type:        "prompt_status",
 			PromptID:    failed.PromptID,
 			Status:      string(PromptStatusFailed),
-			SubmittedBy: workspaceParticipantRef(failed.SenderID),
+			SubmittedBy: workspaceParticipantRef(failed.SubmittedBy),
 		})
 		t.rejectPendingInjectsForPrompt(failed.PromptID, "turn_failed_before_delivery")
 		t.broadcastQueueSnapshot()
@@ -518,7 +517,7 @@ func (t *Topic) HasActiveTurn() bool {
 	return ok
 }
 
-func (t *Topic) InjectMessage(injectID, text, senderID string) (workspaceWSMessage, error) {
+func (t *Topic) InjectMessage(injectID, text string, submittedBy workspaceSubjectRef) (workspaceWSMessage, error) {
 	activePrompt, ok := t.PromptQueue.Active()
 	if !ok || !t.Manager.IsAgentWorking() {
 		return workspaceWSMessage{
@@ -527,7 +526,7 @@ func (t *Topic) InjectMessage(injectID, text, senderID string) (workspaceWSMessa
 			PromptID:    activePrompt.PromptID,
 			Status:      "rejected",
 			Reason:      "no_active_turn",
-			SubmittedBy: workspaceParticipantRef(senderID),
+			SubmittedBy: workspaceParticipantRef(submittedBy),
 		}, fmt.Errorf("no active turn")
 	}
 	if injectID == "" {
@@ -535,7 +534,7 @@ func (t *Topic) InjectMessage(injectID, text, senderID string) (workspaceWSMessa
 	}
 
 	userData := workspacePromptUserData{
-		SubmittedBy: workspaceParticipantRef(senderID),
+		SubmittedBy: workspaceParticipantRef(submittedBy),
 	}
 	message := llm.Message{
 		Role: llm.MessageRoleUser,
@@ -552,9 +551,9 @@ func (t *Topic) InjectMessage(injectID, text, senderID string) (workspaceWSMessa
 
 	t.injectMu.Lock()
 	t.pendingInjects[injectID] = workspacePendingInject{
-		InjectID: injectID,
-		PromptID: activePrompt.PromptID,
-		SenderID: senderID,
+		InjectID:    injectID,
+		PromptID:    activePrompt.PromptID,
+		SubmittedBy: submittedBy,
 	}
 	t.injectMu.Unlock()
 
@@ -571,13 +570,13 @@ func (t *Topic) InjectMessage(injectID, text, senderID string) (workspaceWSMessa
 		InjectID:    injectID,
 		PromptID:    activePrompt.PromptID,
 		Status:      "accepted",
-		SubmittedBy: workspaceParticipantRef(senderID),
+		SubmittedBy: workspaceParticipantRef(submittedBy),
 	}
 	t.broadcastQueueEvent(accepted)
 	return accepted, nil
 }
 
-func (t *Topic) InterruptTurn(reason, senderID string) (workspaceWSMessage, error) {
+func (t *Topic) InterruptTurn(reason string, interruptedBy workspaceSubjectRef) (workspaceWSMessage, error) {
 	activePrompt, ok := t.PromptQueue.Active()
 	if !ok || !t.Manager.IsAgentWorking() {
 		return workspaceWSMessage{}, fmt.Errorf("no active turn")
@@ -587,7 +586,7 @@ func (t *Topic) InterruptTurn(reason, senderID string) (workspaceWSMessage, erro
 	doneMeta := workspaceDoneUserData{
 		Status:        "interrupted",
 		Reason:        reason,
-		InterruptedBy: workspaceParticipantRef(senderID),
+		InterruptedBy: workspaceParticipantRef(interruptedBy),
 	}
 	if err := t.Manager.CancelConversationWithMetadata(t.runtimeCtx, doneMeta); err != nil {
 		return workspaceWSMessage{}, err
@@ -597,7 +596,7 @@ func (t *Topic) InterruptTurn(reason, senderID string) (workspaceWSMessage, erro
 		PromptID:      activePrompt.PromptID,
 		Status:        "interrupted",
 		Reason:        reason,
-		InterruptedBy: workspaceParticipantRef(senderID),
+		InterruptedBy: workspaceParticipantRef(interruptedBy),
 	}, nil
 }
 
@@ -630,7 +629,6 @@ func (t *Topic) broadcastQueueSnapshot() {
 	snapshot := t.QueueSnapshot()
 	t.broadcastWSMessage(workspaceWSMessage{
 		Type:           "queue_snapshot",
-		SessionID:      snapshot.SessionID,
 		ActivePromptID: snapshot.ActivePromptID,
 		Entries:        snapshot.Entries,
 	})
@@ -671,7 +669,7 @@ func (t *Topic) markInjectDelivered(injectID string) {
 		InjectID:    injectID,
 		PromptID:    pending.PromptID,
 		Status:      "delivered",
-		SubmittedBy: workspaceParticipantRef(pending.SenderID),
+		SubmittedBy: workspaceParticipantRef(pending.SubmittedBy),
 	})
 }
 
@@ -693,7 +691,7 @@ func (t *Topic) rejectInject(injectID, reason string) {
 		PromptID:    pending.PromptID,
 		Status:      "rejected",
 		Reason:      reason,
-		SubmittedBy: workspaceParticipantRef(pending.SenderID),
+		SubmittedBy: workspaceParticipantRef(pending.SubmittedBy),
 	})
 }
 
@@ -716,7 +714,7 @@ func (t *Topic) rejectPendingInjectsForPrompt(promptID, reason string) {
 			PromptID:    pending.PromptID,
 			Status:      "rejected",
 			Reason:      reason,
-			SubmittedBy: workspaceParticipantRef(pending.SenderID),
+			SubmittedBy: workspaceParticipantRef(pending.SubmittedBy),
 		})
 	}
 }
@@ -743,14 +741,21 @@ func (t *Topic) consumePendingTurnStatus(promptID string) string {
 
 func workspaceQueueEntryFromPrompt(prompt QueuedPrompt, position int) workspaceQueueEntry {
 	return workspaceQueueEntry{
-		PromptID:  prompt.PromptID,
-		Status:    string(prompt.Status),
-		Text:      prompt.Text,
-		CreatedAt: prompt.QueuedAt.Format(time.RFC3339),
-		Position:  position,
-		SubmittedBy: workspaceSubjectRef{
-			Kind: "participant",
-			ID:   prompt.SenderID,
-		},
+		PromptID:    prompt.PromptID,
+		Status:      string(prompt.Status),
+		Text:        prompt.Text,
+		CreatedAt:   prompt.QueuedAt.Format(time.RFC3339),
+		Position:    position,
+		SubmittedBy: prompt.SubmittedBy,
 	}
+}
+
+func workspaceApprovalActor(submittedBy workspaceSubjectRef, fallback string) string {
+	if submittedBy.DisplayName != "" {
+		return submittedBy.DisplayName
+	}
+	if submittedBy.ID != "" {
+		return submittedBy.ID
+	}
+	return fallback
 }

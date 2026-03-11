@@ -26,11 +26,11 @@ var (
 )
 
 type QueuedPrompt struct {
-	PromptID string
-	Text     string
-	SenderID string
-	QueuedAt time.Time
-	Status   PromptStatus
+	PromptID    string
+	Text        string
+	SubmittedBy workspaceSubjectRef
+	QueuedAt    time.Time
+	Status      PromptStatus
 }
 
 type PromptQueueSnapshot struct {
@@ -134,7 +134,9 @@ func (pq *PromptQueue) Cancel(promptID, senderID string) (QueuedPrompt, int, err
 		if prompt.PromptID != promptID {
 			continue
 		}
-		_ = senderID
+		if senderID == "" || prompt.SubmittedBy.ID != senderID {
+			return QueuedPrompt{}, 0, ErrQueuedPromptNotOwned
+		}
 		removed := prompt
 		removed.Status = PromptStatusCancelled
 		pq.queue = append(pq.queue[:i], pq.queue[i+1:]...)
@@ -154,7 +156,7 @@ func (pq *PromptQueue) CancelMine(senderID string) []QueuedPrompt {
 	removed := make([]QueuedPrompt, 0)
 	filtered := pq.queue[:0]
 	for _, prompt := range pq.queue {
-		if prompt.SenderID == senderID {
+		if prompt.SubmittedBy.ID == senderID {
 			prompt.Status = PromptStatusCancelled
 			removed = append(removed, prompt)
 			continue
@@ -176,7 +178,9 @@ func (pq *PromptQueue) Update(promptID, senderID, text string) (QueuedPrompt, in
 		if prompt.PromptID != promptID {
 			continue
 		}
-		_ = senderID
+		if senderID == "" || prompt.SubmittedBy.ID != senderID {
+			return QueuedPrompt{}, 0, ErrQueuedPromptNotOwned
+		}
 		prompt.Text = text
 		pq.queue[i] = prompt
 		return prompt, i + 1, nil
@@ -195,7 +199,9 @@ func (pq *PromptQueue) Move(promptID, senderID, direction string) (QueuedPrompt,
 		if prompt.PromptID != promptID {
 			continue
 		}
-		_ = senderID
+		if senderID == "" || prompt.SubmittedBy.ID != senderID {
+			return QueuedPrompt{}, 0, ErrQueuedPromptNotOwned
+		}
 
 		target := i
 		switch direction {

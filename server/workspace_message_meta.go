@@ -3,7 +3,7 @@ package server
 import "encoding/json"
 
 const (
-	workspaceProtocolVersion     = "demo-v1"
+	workspaceProtocolVersion = "workspace-topic-v1"
 )
 
 type workspacePromptUserData struct {
@@ -45,11 +45,12 @@ func decodeWorkspaceUserData(raw *string, dest any) bool {
 	return json.Unmarshal([]byte(*raw), dest) == nil
 }
 
-func workspaceParticipantRef(id string) *workspaceSubjectRef {
-	return &workspaceSubjectRef{
-		Kind: "participant",
-		ID:   id,
+func workspaceParticipantRef(subject workspaceSubjectRef) *workspaceSubjectRef {
+	if subject.ID == "" && subject.DisplayName == "" {
+		return nil
 	}
+	ref := subject
+	return &ref
 }
 
 type workspaceTranslatorState struct {

@@ -658,14 +658,13 @@ func (s *Server) handleChatConversation(w http.ResponseWriter, r *http.Request, 
 			}
 		}
 
-		senderID := userEmail
-		if senderID == "" {
-			senderID = strings.TrimSpace(r.Header.Get("X-Workspace-Client-ID"))
+		submittedBy := workspaceSubjectRef{ID: "api", DisplayName: "api"}
+		if principal, ok, err := s.workspacePrincipalFromRequest(r); err == nil && ok {
+			submittedBy = workspaceSubjectFromPrincipal(principal)
+		} else if userEmail != "" {
+			submittedBy = workspaceSubjectRef{ID: userEmail, DisplayName: userEmail}
 		}
-		if senderID == "" {
-			senderID = "api"
-		}
-		prompt := topic.EnqueuePrompt("", req.Message, senderID, nil)
+		prompt := topic.EnqueuePrompt("", req.Message, submittedBy, nil)
 
 		w.WriteHeader(http.StatusAccepted)
 		json.NewEncoder(w).Encode(map[string]string{"status": "accepted", "promptId": prompt.PromptID})

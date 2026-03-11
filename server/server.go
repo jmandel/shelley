@@ -217,47 +217,47 @@ type ConversationListUpdate struct {
 
 // Server manages the HTTP API and active conversations
 type Server struct {
-	db                  *db.DB
-	llmManager          LLMProvider
-	toolSetConfig       claudetool.ToolSetConfig
-	activeConversations map[string]*ConversationManager
-	topicManager        *TopicManager
-	mu                  sync.Mutex
-	logger              *slog.Logger
-	predictableOnly     bool
-	terminalURL         string
-	defaultModel        string
-	links               []Link
-	requireHeader       string
-	conversationGroup   singleflight.Group[string, *ConversationManager]
-	versionChecker      *VersionChecker
-	notifDispatcher     *notifications.Dispatcher
-	shutdownCh          chan struct{} // Signals background routines to stop
-	listenPort          int           // TCP port the server is listening on
-	workspaceName       string
-	workspaceRoot       string
-	startedAt           time.Time
+	db                      *db.DB
+	llmManager              LLMProvider
+	toolSetConfig           claudetool.ToolSetConfig
+	activeConversations     map[string]*ConversationManager
+	topicManager            *TopicManager
+	mu                      sync.Mutex
+	logger                  *slog.Logger
+	predictableOnly         bool
+	terminalURL             string
+	defaultModel            string
+	links                   []Link
+	requireHeader           string
+	conversationGroup       singleflight.Group[string, *ConversationManager]
+	versionChecker          *VersionChecker
+	notifDispatcher         *notifications.Dispatcher
+	shutdownCh              chan struct{} // Signals background routines to stop
+	listenPort              int           // TCP port the server is listening on
+	workspaceName           string
+	workspaceRoot           string
+	startedAt               time.Time
 }
 
 // NewServer creates a new server instance
 func NewServer(database *db.DB, llmManager LLMProvider, toolSetConfig claudetool.ToolSetConfig, logger *slog.Logger, predictableOnly bool, terminalURL, defaultModel, requireHeader string, links []Link) *Server {
 	s := &Server{
-		db:                  database,
-		llmManager:          llmManager,
-		toolSetConfig:       toolSetConfig,
-		activeConversations: make(map[string]*ConversationManager),
-		logger:              logger,
-		predictableOnly:     predictableOnly,
-		terminalURL:         terminalURL,
-		defaultModel:        defaultModel,
-		requireHeader:       requireHeader,
-		links:               links,
-		versionChecker:      NewVersionChecker(),
-		notifDispatcher:     notifications.NewDispatcher(logger),
-		shutdownCh:          make(chan struct{}),
-		workspaceName:       defaultWorkspaceName(),
-		workspaceRoot:       defaultWorkspaceRoot(),
-		startedAt:           time.Now(),
+		db:                      database,
+		llmManager:              llmManager,
+		toolSetConfig:           toolSetConfig,
+		activeConversations:     make(map[string]*ConversationManager),
+		logger:                  logger,
+		predictableOnly:         predictableOnly,
+		terminalURL:             terminalURL,
+		defaultModel:            defaultModel,
+		requireHeader:           requireHeader,
+		links:                   links,
+		versionChecker:          NewVersionChecker(),
+		notifDispatcher:         notifications.NewDispatcher(logger),
+		shutdownCh:              make(chan struct{}),
+		workspaceName:           defaultWorkspaceName(),
+		workspaceRoot:           defaultWorkspaceRoot(),
+		startedAt:               time.Now(),
 	}
 
 	// Set up subagent support
@@ -371,6 +371,7 @@ func (s *Server) registerCanonicalWorkspaceRoutes(mux *http.ServeMux) {
 	mux.Handle("POST /ws/topics", http.HandlerFunc(s.handleWorkspaceTopics))
 	mux.Handle("GET /ws/topics/{name}", http.HandlerFunc(s.handleWorkspaceTopic))
 	mux.Handle("DELETE /ws/topics/{name}", http.HandlerFunc(s.handleWorkspaceTopic))
+	mux.Handle("GET /ws/topics/{name}/events", http.HandlerFunc(s.handleWorkspaceTopicWSByName))
 	mux.Handle("GET /ws/topics/{name}/queue", http.HandlerFunc(s.handleWorkspaceTopicQueue))
 	mux.Handle("PATCH /ws/topics/{name}/queue/{prompt}", http.HandlerFunc(s.handleWorkspaceTopicQueueEntry))
 	mux.Handle("DELETE /ws/topics/{name}/queue/{prompt}", http.HandlerFunc(s.handleWorkspaceTopicQueueEntry))
@@ -399,6 +400,7 @@ func (s *Server) registerWorkspaceCompatibilityRoutes(mux *http.ServeMux) {
 	mux.Handle("POST /topics", http.HandlerFunc(s.handleWorkspaceTopics))
 	mux.Handle("GET /topics/{name}", http.HandlerFunc(s.handleWorkspaceTopic))
 	mux.Handle("DELETE /topics/{name}", http.HandlerFunc(s.handleWorkspaceTopic))
+	mux.Handle("GET /topics/{name}/events", http.HandlerFunc(s.handleWorkspaceTopicWSByName))
 	mux.Handle("GET /topics/{name}/queue", http.HandlerFunc(s.handleWorkspaceTopicQueue))
 	mux.Handle("PATCH /topics/{name}/queue/{prompt}", http.HandlerFunc(s.handleWorkspaceTopicQueueEntry))
 	mux.Handle("DELETE /topics/{name}/queue/{prompt}", http.HandlerFunc(s.handleWorkspaceTopicQueueEntry))
@@ -406,17 +408,6 @@ func (s *Server) registerWorkspaceCompatibilityRoutes(mux *http.ServeMux) {
 	mux.Handle("POST /topics/{name}/queue:clear-mine", http.HandlerFunc(s.handleWorkspaceTopicQueueClearMine))
 	mux.Handle("POST /topics/{name}/inject", http.HandlerFunc(s.handleWorkspaceTopicInject))
 	mux.Handle("POST /topics/{name}/interrupt", http.HandlerFunc(s.handleWorkspaceTopicInterrupt))
-
-	// ACP aliases remain for the checked-out Bun CLI and wmlet-style clients.
-	mux.Handle("GET /acp", http.HandlerFunc(s.handleWorkspaceTopicQueryWS))
-	mux.Handle("GET /acp/{topic}", http.HandlerFunc(s.handleWorkspaceTopicWS))
-	mux.Handle("GET /ws/acp", http.HandlerFunc(s.handleWorkspaceTopicQueryWS))
-	mux.Handle("GET /ws/acp/{topic}", http.HandlerFunc(s.handleWorkspaceTopicWS))
-
-	// Single-workspace manager shim remains for the checked-out Bun CLI.
-	mux.Handle("GET /workspaces", http.HandlerFunc(s.handleWorkspaceManager))
-	mux.Handle("POST /workspaces", http.HandlerFunc(s.handleWorkspaceManager))
-	mux.Handle("GET /workspaces/{name}", http.HandlerFunc(s.handleWorkspaceManagerWorkspace))
 }
 
 // handleValidateCwd validates that a path exists and is a directory

@@ -8,6 +8,7 @@ require (
 	github.com/coder/websocket v1.8.12
 	github.com/creack/pty v1.1.24
 	github.com/fynelabs/selfupdate v0.2.1
+	github.com/golang-jwt/jwt/v5 v5.3.0
 	github.com/google/uuid v1.6.0
 	github.com/modelcontextprotocol/go-sdk v1.4.0
 	github.com/oklog/ulid/v2 v2.1.1

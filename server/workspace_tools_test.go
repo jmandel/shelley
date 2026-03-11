@@ -429,7 +429,7 @@ func TestWorkspaceToolGrantRefreshesTopicSystemPromptDisplayData(t *testing.T) {
 	httpServer := httptest.NewServer(mux)
 	defer httpServer.Close()
 
-	sessionID := createWorkspaceTopic(t, httpServer.URL, "jira-ui")
+	sessionID := createWorkspaceTopic(t, database, httpServer.URL, "jira-ui")
 
 	if tools := systemPromptToolNames(t, database, sessionID); containsString(tools, "workspace_hl7-jira") {
 		t.Fatalf("expected no workspace_hl7-jira before registration, got %#v", tools)
@@ -514,13 +514,13 @@ func TestWorkspaceToolsRejectInvalidActionSchema(t *testing.T) {
 }
 
 func TestWorkspaceToolsRefreshActiveTopicTurns(t *testing.T) {
-	server, _, predictable := newTestServer(t)
+	server, database, predictable := newTestServer(t)
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
 	httpServer := httptest.NewServer(mux)
 	defer httpServer.Close()
 
-	sessionID := createWorkspaceTopic(t, httpServer.URL, "tool-refresh")
+	sessionID := createWorkspaceTopic(t, database, httpServer.URL, "tool-refresh")
 
 	sendTopicAPIChat(t, httpServer.URL, sessionID, "echo: before grant")
 	waitFor(t, 2*time.Second, func() bool {
@@ -574,14 +574,14 @@ func TestWorkspaceToolsRefreshActiveTopicTurns(t *testing.T) {
 }
 
 func TestWorkspaceToolsScopeGrantsToMatchingTopic(t *testing.T) {
-	server, _, predictable := newTestServer(t)
+	server, database, predictable := newTestServer(t)
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
 	httpServer := httptest.NewServer(mux)
 	defer httpServer.Close()
 
-	alphaSessionID := createWorkspaceTopic(t, httpServer.URL, "alpha")
-	betaSessionID := createWorkspaceTopic(t, httpServer.URL, "beta")
+	alphaSessionID := createWorkspaceTopic(t, database, httpServer.URL, "alpha")
+	betaSessionID := createWorkspaceTopic(t, database, httpServer.URL, "beta")
 
 	createWorkspaceTool(t, httpServer.URL, `{
 		"name":"gmail",
@@ -646,13 +646,13 @@ func TestWorkspaceToolsRejectInvalidGrantAccess(t *testing.T) {
 }
 
 func TestWorkspaceToolCallsAreLogged(t *testing.T) {
-	server, _, _ := newTestServer(t)
+	server, database, _ := newTestServer(t)
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
 	httpServer := httptest.NewServer(mux)
 	defer httpServer.Close()
 
-	sessionID := createWorkspaceTopic(t, httpServer.URL, "log-allowed")
+	sessionID := createWorkspaceTopic(t, database, httpServer.URL, "log-allowed")
 	createWorkspaceTool(t, httpServer.URL, `{
 		"name":"github",
 		"actions":["read","write"]
@@ -680,13 +680,13 @@ func TestWorkspaceToolCallsAreLogged(t *testing.T) {
 }
 
 func TestWorkspaceToolApprovalRequiredLogsDenied(t *testing.T) {
-	server, _, _ := newTestServer(t)
+	server, database, _ := newTestServer(t)
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
 	httpServer := httptest.NewServer(mux)
 	defer httpServer.Close()
 
-	sessionID := createWorkspaceTopic(t, httpServer.URL, "log-approval")
+	sessionID := createWorkspaceTopic(t, database, httpServer.URL, "log-approval")
 	createWorkspaceTool(t, httpServer.URL, `{
 		"name":"gmail",
 		"actions":["send"]
@@ -731,8 +731,8 @@ func TestWorkspaceToolApprovalResponseLogsApproved(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws/topic/approval-live"
-	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws/topics/approval-live/events"
+	conn, _, err := websocket.Dial(ctx, wsURL, workspaceAuthDialOptions(t, "alice@example.com"))
 	if err != nil {
 		t.Fatalf("failed to dial workspace websocket: %v", err)
 	}
@@ -764,7 +764,6 @@ func TestWorkspaceToolApprovalResponseLogsApproved(t *testing.T) {
 		Type:       "approval_response",
 		ToolCallID: approvalRequest.ToolCallID,
 		Approved:   true,
-		Approver:   "alice@example.com",
 	}); err != nil {
 		t.Fatalf("failed to send approval response: %v", err)
 	}
@@ -787,7 +786,7 @@ func TestWorkspaceToolApprovalResponseLogsApproved(t *testing.T) {
 	}
 }
 
-func createWorkspaceTopic(t *testing.T, baseURL, topicName string) string {
+func createWorkspaceTopic(t *testing.T, database *db.DB, baseURL, topicName string) string {
 	t.Helper()
 
 	req, err := http.NewRequest(http.MethodPost, baseURL+"/ws/topics", bytes.NewBufferString(`{"name":"`+topicName+`"}`))
@@ -809,7 +808,7 @@ func createWorkspaceTopic(t *testing.T, baseURL, topicName string) string {
 	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
 		t.Fatalf("failed to decode topic create response: %v", err)
 	}
-	return created.SessionID
+	return conversationIDForTopic(t, database, created.Name)
 }
 
 func createWorkspaceTool(t *testing.T, baseURL, rawJSON string) {

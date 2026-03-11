@@ -363,7 +363,7 @@ func TestWorkspaceToolMCPStreamableHTTPEndToEndTopicTurn(t *testing.T) {
 	}, &mcp.StreamableHTTPOptions{DisableLocalhostProtection: true}))
 	defer transportServer.Close()
 
-	sessionID := createWorkspaceTopic(t, httpServer.URL, "mcp-e2e")
+	sessionID := createWorkspaceTopic(t, database, httpServer.URL, "mcp-e2e")
 	createWorkspaceTool(t, httpServer.URL, `{
 		"name":"http-greeter",
 		"actions":["greet"],
@@ -425,15 +425,15 @@ func TestWorkspaceToolMCPApprovalExecutesAfterApproval(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	wsURL := "ws" + httpServer.URL[len("http"):] + "/ws/topic/mcp-approval"
-	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	wsURL := "ws" + httpServer.URL[len("http"):] + "/ws/topics/mcp-approval/events"
+	conn, _, err := websocket.Dial(ctx, wsURL, workspaceAuthDialOptions(t, "alice@example.com"))
 	if err != nil {
 		t.Fatalf("failed to dial workspace websocket: %v", err)
 	}
 	defer conn.Close(websocket.StatusNormalClosure, "test complete")
 
 	waitForConnectedMessage(t, ctx, conn)
-	sessionID := getWorkspaceTopicInfo(t, httpServer.URL+"/ws/topics/mcp-approval").SessionID
+	sessionID := conversationIDForTopic(t, database, "mcp-approval")
 
 	if err := wsjson.Write(ctx, conn, workspacePromptMessage{
 		Type: "prompt",
@@ -461,7 +461,6 @@ func TestWorkspaceToolMCPApprovalExecutesAfterApproval(t *testing.T) {
 		Type:       "approval_response",
 		ToolCallID: approvalRequest.ToolCallID,
 		Approved:   true,
-		Approver:   "alice@example.com",
 	}); err != nil {
 		t.Fatalf("failed to send approval response: %v", err)
 	}
