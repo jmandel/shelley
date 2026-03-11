@@ -217,47 +217,47 @@ type ConversationListUpdate struct {
 
 // Server manages the HTTP API and active conversations
 type Server struct {
-	db                      *db.DB
-	llmManager              LLMProvider
-	toolSetConfig           claudetool.ToolSetConfig
-	activeConversations     map[string]*ConversationManager
-	topicManager            *TopicManager
-	mu                      sync.Mutex
-	logger                  *slog.Logger
-	predictableOnly         bool
-	terminalURL             string
-	defaultModel            string
-	links                   []Link
-	requireHeader           string
-	conversationGroup       singleflight.Group[string, *ConversationManager]
-	versionChecker          *VersionChecker
-	notifDispatcher         *notifications.Dispatcher
-	shutdownCh              chan struct{} // Signals background routines to stop
-	listenPort              int           // TCP port the server is listening on
-	workspaceName           string
-	workspaceRoot           string
-	startedAt               time.Time
+	db                  *db.DB
+	llmManager          LLMProvider
+	toolSetConfig       claudetool.ToolSetConfig
+	activeConversations map[string]*ConversationManager
+	topicManager        *TopicManager
+	mu                  sync.Mutex
+	logger              *slog.Logger
+	predictableOnly     bool
+	terminalURL         string
+	defaultModel        string
+	links               []Link
+	requireHeader       string
+	conversationGroup   singleflight.Group[string, *ConversationManager]
+	versionChecker      *VersionChecker
+	notifDispatcher     *notifications.Dispatcher
+	shutdownCh          chan struct{} // Signals background routines to stop
+	listenPort          int           // TCP port the server is listening on
+	workspaceName       string
+	workspaceRoot       string
+	startedAt           time.Time
 }
 
 // NewServer creates a new server instance
 func NewServer(database *db.DB, llmManager LLMProvider, toolSetConfig claudetool.ToolSetConfig, logger *slog.Logger, predictableOnly bool, terminalURL, defaultModel, requireHeader string, links []Link) *Server {
 	s := &Server{
-		db:                      database,
-		llmManager:              llmManager,
-		toolSetConfig:           toolSetConfig,
-		activeConversations:     make(map[string]*ConversationManager),
-		logger:                  logger,
-		predictableOnly:         predictableOnly,
-		terminalURL:             terminalURL,
-		defaultModel:            defaultModel,
-		requireHeader:           requireHeader,
-		links:                   links,
-		versionChecker:          NewVersionChecker(),
-		notifDispatcher:         notifications.NewDispatcher(logger),
-		shutdownCh:              make(chan struct{}),
-		workspaceName:           defaultWorkspaceName(),
-		workspaceRoot:           defaultWorkspaceRoot(),
-		startedAt:               time.Now(),
+		db:                  database,
+		llmManager:          llmManager,
+		toolSetConfig:       toolSetConfig,
+		activeConversations: make(map[string]*ConversationManager),
+		logger:              logger,
+		predictableOnly:     predictableOnly,
+		terminalURL:         terminalURL,
+		defaultModel:        defaultModel,
+		requireHeader:       requireHeader,
+		links:               links,
+		versionChecker:      NewVersionChecker(),
+		notifDispatcher:     notifications.NewDispatcher(logger),
+		shutdownCh:          make(chan struct{}),
+		workspaceName:       defaultWorkspaceName(),
+		workspaceRoot:       defaultWorkspaceRoot(),
+		startedAt:           time.Now(),
 	}
 
 	// Set up subagent support
@@ -379,11 +379,12 @@ func (s *Server) registerCanonicalWorkspaceRoutes(mux *http.ServeMux) {
 	mux.Handle("POST /ws/topics/{name}/queue:clear-mine", http.HandlerFunc(s.handleWorkspaceTopicQueueClearMine))
 	mux.Handle("POST /ws/topics/{name}/inject", http.HandlerFunc(s.handleWorkspaceTopicInject))
 	mux.Handle("POST /ws/topics/{name}/interrupt", http.HandlerFunc(s.handleWorkspaceTopicInterrupt))
-	mux.Handle("GET /ws/files", http.HandlerFunc(s.handleWorkspaceFile))
-	mux.Handle("GET /ws/files/{$}", http.HandlerFunc(s.handleWorkspaceFile))
-	mux.Handle("GET /ws/files/{path...}", http.HandlerFunc(s.handleWorkspaceFile))
-	mux.Handle("PUT /ws/files/{path...}", http.HandlerFunc(s.handleWorkspaceFile))
-	mux.Handle("DELETE /ws/files/{path...}", http.HandlerFunc(s.handleWorkspaceFile))
+	mux.Handle("GET /ws/files", http.HandlerFunc(s.handleWorkspaceFiles))
+	mux.Handle("DELETE /ws/files", http.HandlerFunc(s.handleWorkspaceFiles))
+	mux.Handle("GET /ws/files/content", http.HandlerFunc(s.handleWorkspaceFileContent))
+	mux.Handle("PUT /ws/files/content", http.HandlerFunc(s.handleWorkspaceFileContent))
+	mux.Handle("POST /ws/files/directories", http.HandlerFunc(s.handleWorkspaceDirectories))
+	mux.Handle("POST /ws/files/move", http.HandlerFunc(s.handleWorkspaceMove))
 	mux.Handle("GET /ws/tools", http.HandlerFunc(s.handleWorkspaceTools))
 	mux.Handle("POST /ws/tools", http.HandlerFunc(s.handleWorkspaceTools))
 	mux.Handle("GET /ws/tools/{tool}", http.HandlerFunc(s.handleWorkspaceTool))
