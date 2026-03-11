@@ -27,7 +27,13 @@ type workspaceActionInfo struct {
 
 func normalizeWorkspaceActionDefs(raw json.RawMessage) ([]workspaceActionDef, error) {
 	if len(raw) == 0 {
-		return nil, fmt.Errorf("actions required")
+		return nil, nil
+	}
+
+	// Check for empty array "[]"
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "[]" || trimmed == "null" {
+		return nil, nil
 	}
 
 	var names []string
@@ -47,6 +53,9 @@ func normalizeWorkspaceActionDefs(raw json.RawMessage) ([]workspaceActionDef, er
 }
 
 func decodeWorkspaceActionDefs(raw string) ([]workspaceActionDef, error) {
+	if raw == "" {
+		return nil, nil
+	}
 	return normalizeWorkspaceActionDefs(json.RawMessage(raw))
 }
 

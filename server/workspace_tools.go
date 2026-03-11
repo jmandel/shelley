@@ -17,7 +17,6 @@ import (
 type workspaceGrantInfo struct {
 	GrantID   string          `json:"grantId"`
 	Subject   string          `json:"subject"`
-	Actions   []string        `json:"actions"`
 	Tools     []string        `json:"tools"`
 	Access    string          `json:"access"`
 	Approvers []string        `json:"approvers,omitempty"`
@@ -26,12 +25,9 @@ type workspaceGrantInfo struct {
 }
 
 type workspaceToolInfo struct {
-	ToolID        string                 `json:"toolId"`
 	Name          string                 `json:"name"`
 	Description   string                 `json:"description,omitempty"`
 	Protocol      string                 `json:"protocol"`
-	Actions       []string               `json:"actions"`
-	ActionDefs    []workspaceActionInfo  `json:"actionDefs,omitempty"`
 	Transport     json.RawMessage        `json:"transport,omitempty"`
 	Tools         []workspaceActionInfo  `json:"tools,omitempty"`
 	Provider      string                 `json:"provider,omitempty"`
@@ -112,7 +108,10 @@ func (s *Server) handleWorkspaceToolsCreate(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	actionsJSON, err := json.Marshal(actionDefs)
+	actionsJSON := json.RawMessage("[]")
+	if len(actionDefs) > 0 {
+		actionsJSON, err = json.Marshal(actionDefs)
+	}
 	if err != nil {
 		http.Error(w, "Invalid actions", http.StatusBadRequest)
 		return
@@ -276,7 +275,7 @@ func (s *Server) handleWorkspaceToolGrants(w http.ResponseWriter, r *http.Reques
 		req.Actions = append([]string(nil), req.Tools...)
 	}
 	if len(req.Actions) == 0 {
-		http.Error(w, "actions required", http.StatusBadRequest)
+		http.Error(w, "tools required", http.StatusBadRequest)
 		return
 	}
 	if req.Access == "" {
@@ -293,11 +292,18 @@ func (s *Server) handleWorkspaceToolGrants(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
-	toolActions := workspaceActionNames(toolActionDefs)
-	for _, action := range req.Actions {
-		if !containsString(toolActions, action) {
-			http.Error(w, "unknown action for tool", http.StatusBadRequest)
-			return
+	// When tools are pre-registered, validate grant actions are a subset.
+	// When tools is empty (MCP discovery), accept any action names.
+	if len(toolActionDefs) > 0 {
+		toolActions := workspaceActionNames(toolActionDefs)
+		for _, action := range req.Actions {
+			if action == "*" {
+				continue
+			}
+			if !containsString(toolActions, action) {
+				http.Error(w, "unknown action for tool", http.StatusBadRequest)
+				return
+			}
 		}
 	}
 
@@ -432,14 +438,11 @@ func (s *Server) workspaceToolInfo(ctx context.Context, tool generated.Workspace
 	}
 
 	info := workspaceToolInfo{
-		ToolID:     tool.ToolID,
-		Name:       tool.Name,
-		Protocol:   tool.Protocol,
-		Actions:    workspaceActionNames(actionDefs),
-		ActionDefs: workspaceActionInfos(actionDefs),
-		Tools:      workspaceActionInfos(actionDefs),
-		CreatedAt:  tool.CreatedAt.Format(time.RFC3339),
-		Grants:     make([]workspaceGrantInfo, 0, len(grants)),
+		Name:      tool.Name,
+		Protocol:  tool.Protocol,
+		Tools:     workspaceActionInfos(actionDefs),
+		CreatedAt: tool.CreatedAt.Format(time.RFC3339),
+		Grants:    make([]workspaceGrantInfo, 0, len(grants)),
 	}
 	if includeLog {
 		info.Log = make([]workspaceToolLogInfo, 0, len(logs))
@@ -481,8 +484,7 @@ func workspaceGrantInfoFromRecord(grant generated.WorkspaceGrant) (workspaceGran
 	info := workspaceGrantInfo{
 		GrantID:   grant.GrantID,
 		Subject:   grant.Subject,
-		Actions:   actions,
-		Tools:     append([]string(nil), actions...),
+		Tools:     actions,
 		Access:    grant.Access,
 		CreatedAt: grant.CreatedAt.Format(time.RFC3339),
 	}

@@ -50,7 +50,7 @@ func TestWorkspaceToolsLifecycle(t *testing.T) {
 	if err := json.NewDecoder(createResp.Body).Decode(&created); err != nil {
 		t.Fatalf("failed to decode tool create response: %v", err)
 	}
-	if created.Name != "github" || len(created.Actions) != 2 || created.Provider != "alice@example.com" {
+	if created.Name != "github" || len(created.Tools) != 2 || created.Provider != "alice@example.com" {
 		t.Fatalf("unexpected created tool: %#v", created)
 	}
 
@@ -84,8 +84,8 @@ func TestWorkspaceToolsLifecycle(t *testing.T) {
 	if err := json.NewDecoder(getResp.Body).Decode(&fetched); err != nil {
 		t.Fatalf("failed to decode workspace tool get: %v", err)
 	}
-	if fetched.ToolID != created.ToolID {
-		t.Fatalf("expected tool id %q, got %q", created.ToolID, fetched.ToolID)
+	if fetched.Name != created.Name {
+		t.Fatalf("expected tool name %q, got %q", created.Name, fetched.Name)
 	}
 
 	grantReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/ws/tools/github/grants", bytes.NewBufferString(`{
@@ -111,7 +111,7 @@ func TestWorkspaceToolsLifecycle(t *testing.T) {
 	if err := json.NewDecoder(grantResp.Body).Decode(&grant); err != nil {
 		t.Fatalf("failed to decode grant create response: %v", err)
 	}
-	if grant.Subject != "agent:*" || len(grant.Actions) != 1 || grant.Actions[0] != "read" {
+	if grant.Subject != "agent:*" || len(grant.Tools) != 1 || grant.Tools[0] != "read" {
 		t.Fatalf("unexpected created grant: %#v", grant)
 	}
 
@@ -207,24 +207,36 @@ func TestWorkspaceToolsAcceptRFCPayloadShape(t *testing.T) {
 
 	createReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/ws/tools", bytes.NewBufferString(`{
 		"name":"hl7-jira",
-		"description":"Search realistic HL7 Jira fixture data",
+		"description":"Search and inspect issues from the real HL7 Jira SQLite snapshot",
 		"provider":"demo@acme.example",
 		"protocol":"mcp",
 		"transport":{
 			"type":"stdio",
 			"command":"bun",
-			"args":["./.demo/hl7-jira-mcp.js"],
-			"cwd":"."
+			"args":["/tools/hl7-jira-support/bin/hl7-jira-mcp.js"],
+			"cwd":"/tools/hl7-jira-support",
+			"env":{"HL7_JIRA_DB":"/tools/hl7-jira-support/data/jira-data.db"}
 		},
 		"tools":[
 			{
 				"name":"jira.search",
 				"title":"Search HL7 Jira",
-				"description":"Search fixture issues related to validation behavior",
+				"description":"Search the real HL7 Jira SQLite snapshot for validator and FHIRPath issues",
 				"inputSchema":{
 					"type":"object",
 					"properties":{"query":{"type":"string"}},
 					"required":["query"],
+					"additionalProperties":false
+				}
+			},
+			{
+				"name":"jira.read",
+				"title":"Read HL7 Jira Issue",
+				"description":"Read the full stored JSON for one HL7 Jira issue",
+				"inputSchema":{
+					"type":"object",
+					"properties":{"key":{"type":"string"}},
+					"required":["key"],
 					"additionalProperties":false
 				}
 			}
@@ -248,7 +260,7 @@ func TestWorkspaceToolsAcceptRFCPayloadShape(t *testing.T) {
 	if err := json.NewDecoder(createResp.Body).Decode(&created); err != nil {
 		t.Fatalf("failed to decode RFC-shaped tool create response: %v", err)
 	}
-	if created.Name != "hl7-jira" || len(created.Tools) != 1 || created.Tools[0].Name != "jira.search" {
+	if created.Name != "hl7-jira" || len(created.Tools) != 2 || !workspaceToolNamesInclude(created.Tools, "jira.search", "jira.read") {
 		t.Fatalf("unexpected RFC-shaped created tool: %#v", created)
 	}
 	if !json.Valid(created.Transport) || !strings.Contains(string(created.Transport), `"type":"stdio"`) {
@@ -257,7 +269,7 @@ func TestWorkspaceToolsAcceptRFCPayloadShape(t *testing.T) {
 
 	grantReq, err := http.NewRequest(http.MethodPost, httpServer.URL+"/ws/tools/hl7-jira/grants", bytes.NewBufferString(`{
 		"subject":"agent:*",
-		"tools":["jira.search"],
+		"tools":["jira.search","jira.read"],
 		"access":"allowed"
 	}`))
 	if err != nil {
@@ -278,12 +290,12 @@ func TestWorkspaceToolsAcceptRFCPayloadShape(t *testing.T) {
 	if err := json.NewDecoder(grantResp.Body).Decode(&grant); err != nil {
 		t.Fatalf("failed to decode RFC-shaped grant response: %v", err)
 	}
-	if len(grant.Tools) != 1 || grant.Tools[0] != "jira.search" {
+	if len(grant.Tools) != 2 || !containsAllStrings(grant.Tools, "jira.search", "jira.read") {
 		t.Fatalf("unexpected RFC-shaped grant response: %#v", grant)
 	}
 
 	fetched := getWorkspaceToolInfo(t, httpServer.URL, "hl7-jira")
-	if len(fetched.Grants) != 1 || len(fetched.Grants[0].Tools) != 1 || fetched.Grants[0].Tools[0] != "jira.search" {
+	if len(fetched.Grants) != 1 || len(fetched.Grants[0].Tools) != 2 || !containsAllStrings(fetched.Grants[0].Tools, "jira.search", "jira.read") {
 		t.Fatalf("unexpected fetched RFC-shaped tool grants: %#v", fetched.Grants)
 	}
 }
@@ -328,17 +340,14 @@ func TestWorkspaceToolsStoreActionMetadataAndRuntimeSchema(t *testing.T) {
 	}`)
 
 	toolInfo := getWorkspaceToolInfo(t, httpServer.URL, "crm")
-	if len(toolInfo.Actions) != 2 || toolInfo.Actions[0] != "read" || toolInfo.Actions[1] != "search" {
-		t.Fatalf("unexpected action names: %#v", toolInfo.Actions)
+	if len(toolInfo.Tools) != 2 || toolInfo.Tools[0].Name != "read" || toolInfo.Tools[1].Name != "search" {
+		t.Fatalf("unexpected tools: %#v", toolInfo.Tools)
 	}
-	if len(toolInfo.ActionDefs) != 2 {
-		t.Fatalf("expected action defs in tool info, got %#v", toolInfo.ActionDefs)
+	if toolInfo.Tools[0].Description != "Read customer records" {
+		t.Fatalf("unexpected first tool def: %#v", toolInfo.Tools[0])
 	}
-	if toolInfo.ActionDefs[0].Name != "read" || toolInfo.ActionDefs[0].Description != "Read customer records" {
-		t.Fatalf("unexpected first action def: %#v", toolInfo.ActionDefs[0])
-	}
-	if !json.Valid(toolInfo.ActionDefs[0].InputSchema) {
-		t.Fatalf("expected valid input schema in action def, got %q", string(toolInfo.ActionDefs[0].InputSchema))
+	if !json.Valid(toolInfo.Tools[0].InputSchema) {
+		t.Fatalf("expected valid input schema in tool def, got %q", string(toolInfo.Tools[0].InputSchema))
 	}
 
 	runtimeTool := workspaceRuntimeTool(t, server, "alpha", "workspace_crm")
@@ -428,16 +437,26 @@ func TestWorkspaceToolGrantRefreshesTopicSystemPromptDisplayData(t *testing.T) {
 
 	createWorkspaceTool(t, httpServer.URL, `{
 		"name":"hl7-jira",
-		"description":"Search realistic HL7 Jira fixture data",
+		"description":"Search and inspect issues from the real HL7 Jira SQLite snapshot",
 		"protocol":"mcp",
 		"actions":[
 			{
 				"name":"jira.search",
-				"description":"Search Jira",
+				"description":"Search HL7 Jira issues",
 				"inputSchema":{
 					"type":"object",
 					"properties":{"query":{"type":"string"}},
 					"required":["query"],
+					"additionalProperties":false
+				}
+			},
+			{
+				"name":"jira.read",
+				"description":"Read one HL7 Jira issue",
+				"inputSchema":{
+					"type":"object",
+					"properties":{"key":{"type":"string"}},
+					"required":["key"],
 					"additionalProperties":false
 				}
 			}
@@ -445,14 +464,15 @@ func TestWorkspaceToolGrantRefreshesTopicSystemPromptDisplayData(t *testing.T) {
 		"config":{
 			"type":"stdio",
 			"command":"bun",
-			"args":["./.demo/hl7-jira-mcp.js"],
-			"cwd":"."
+			"args":["/tools/hl7-jira-support/bin/hl7-jira-mcp.js"],
+			"cwd":"/tools/hl7-jira-support",
+			"env":{"HL7_JIRA_DB":"/tools/hl7-jira-support/data/jira-data.db"}
 		}
 	}`)
 
 	createWorkspaceGrant(t, httpServer.URL, "hl7-jira", `{
 		"subject":"agent:*",
-		"actions":["jira.search"],
+		"actions":["jira.search","jira.read"],
 		"access":"allowed"
 	}`)
 
@@ -899,6 +919,23 @@ func requestToolNames(req *llm.Request) []string {
 		names = append(names, tool.Name)
 	}
 	return names
+}
+
+func containsAllStrings(values []string, wants ...string) bool {
+	for _, want := range wants {
+		if !containsString(values, want) {
+			return false
+		}
+	}
+	return true
+}
+
+func workspaceToolNamesInclude(tools []workspaceActionInfo, wants ...string) bool {
+	names := make([]string, 0, len(tools))
+	for _, tool := range tools {
+		names = append(names, tool.Name)
+	}
+	return containsAllStrings(names, wants...)
 }
 
 func getWorkspaceToolInfo(t *testing.T, baseURL, toolName string) workspaceToolInfo {

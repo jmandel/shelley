@@ -65,7 +65,6 @@ func (s *Server) buildTopicWorkspaceTool(ctx context.Context, topicName string, 
 	if err != nil {
 		return nil, err
 	}
-	registeredActions := workspaceActionNames(actionDefs)
 
 	var grantRecords []generated.WorkspaceGrant
 	if err := s.db.Queries(ctx, func(q *generated.Queries) error {
@@ -75,6 +74,8 @@ func (s *Server) buildTopicWorkspaceTool(ctx context.Context, topicName string, 
 	}); err != nil {
 		return nil, err
 	}
+
+	registeredActions := workspaceActionNames(actionDefs)
 
 	actionPolicies, err := workspaceActionPolicies(grantRecords, topicName, registeredActions)
 	if err != nil {
@@ -356,6 +357,13 @@ func workspaceActionPolicies(grantRecords []generated.WorkspaceGrant, topicName 
 			return nil, err
 		}
 		for _, action := range grantActions {
+			// Wildcard grant applies to all registered actions
+			if action == "*" {
+				for _, regAction := range registeredActions {
+					policies[regAction] = strongerWorkspaceAccess(policies[regAction], grant.Access)
+				}
+				continue
+			}
 			if _, ok := validActions[action]; !ok {
 				continue
 			}
@@ -390,12 +398,19 @@ func workspaceActionApprovers(grantRecords []generated.WorkspaceGrant, topicName
 			}
 		}
 		for _, action := range grantActions {
-			if _, ok := validActions[action]; !ok {
-				continue
+			// Wildcard grant applies to all registered actions
+			targetActions := []string{action}
+			if action == "*" {
+				targetActions = registeredActions
 			}
-			for _, approver := range approvers {
-				if !containsString(approversByAction[action], approver) {
-					approversByAction[action] = append(approversByAction[action], approver)
+			for _, targetAction := range targetActions {
+				if _, ok := validActions[targetAction]; !ok {
+					continue
+				}
+				for _, approver := range approvers {
+					if !containsString(approversByAction[targetAction], approver) {
+						approversByAction[targetAction] = append(approversByAction[targetAction], approver)
+					}
 				}
 			}
 		}

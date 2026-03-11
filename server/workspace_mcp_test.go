@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -118,7 +119,7 @@ func TestWorkspaceToolMCPStdioResolvesCommandFromWorkspaceToolsDir(t *testing.T)
 	}
 }
 
-func TestWorkspaceToolMCPStdioBunFixtureFromWorkspace(t *testing.T) {
+func TestWorkspaceToolMCPStdioJiraSupportBundleFromWorkspace(t *testing.T) {
 	server, _, _ := newTestServer(t)
 	workspaceRoot := t.TempDir()
 	if err := server.SetWorkspaceRoot(workspaceRoot); err != nil {
@@ -129,40 +130,37 @@ func TestWorkspaceToolMCPStdioBunFixtureFromWorkspace(t *testing.T) {
 	httpServer := httptest.NewServer(mux)
 	defer httpServer.Close()
 
-	fixtureSource, err := filepath.Abs(filepath.Join("..", "..", "shelleymanager", "manager", "testdata", "hl7-jira-mcp.js"))
-	if err != nil {
-		t.Fatalf("failed to resolve fixture source: %v", err)
-	}
-	fixtureData, err := os.ReadFile(fixtureSource)
-	if err != nil {
-		t.Fatalf("failed to read fixture source: %v", err)
-	}
-	if err := os.MkdirAll(filepath.Join(workspaceRoot, ".demo"), 0o755); err != nil {
-		t.Fatalf("failed to create workspace fixture dir: %v", err)
-	}
-	fixturePath := filepath.Join(workspaceRoot, ".demo", "hl7-jira-mcp.js")
-	if err := os.WriteFile(fixturePath, fixtureData, 0o755); err != nil {
-		t.Fatalf("failed to write workspace fixture: %v", err)
-	}
+	scriptPath, dbPath := writeHL7JiraWorkspaceBundle(t, workspaceRoot)
 
 	createWorkspaceTool(t, httpServer.URL, `{
 		"name":"hl7-jira",
-		"description":"Search realistic HL7 Jira fixture data",
+		"description":"Search and inspect issues from the real HL7 Jira SQLite snapshot",
 		"protocol":"mcp",
 		"transport":{
 			"type":"stdio",
 			"command":"bun",
-			"args":["./.demo/hl7-jira-mcp.js"],
-			"cwd":"."
+			"args":["`+scriptPath+`"],
+			"cwd":".",
+			"env":{"HL7_JIRA_DB":"`+dbPath+`"}
 		},
 		"tools":[
 			{
 				"name":"jira.search",
-				"description":"Search realistic HL7 Jira issues related to validation and FHIRPath behavior",
+				"description":"Search real HL7 Jira issues related to validation and FHIRPath behavior",
 				"inputSchema":{
 					"type":"object",
 					"properties":{"query":{"type":"string"}},
 					"required":["query"],
+					"additionalProperties":false
+				}
+			},
+			{
+				"name":"jira.read",
+				"description":"Read the full stored JSON for one HL7 Jira issue",
+				"inputSchema":{
+					"type":"object",
+					"properties":{"key":{"type":"string"}},
+					"required":["key"],
 					"additionalProperties":false
 				}
 			}
@@ -170,17 +168,25 @@ func TestWorkspaceToolMCPStdioBunFixtureFromWorkspace(t *testing.T) {
 	}`)
 	createWorkspaceGrant(t, httpServer.URL, "hl7-jira", `{
 		"subject":"agent:*",
-		"tools":["jira.search"],
+		"tools":["jira.search","jira.read"],
 		"access":"allowed"
 	}`)
 
 	tool := workspaceRuntimeTool(t, server, "alpha", "workspace_hl7-jira")
-	result := tool.Run(context.Background(), []byte(`{"action":"jira.search","input":{"query":"validation error handling"}}`))
+	result := tool.Run(context.Background(), []byte(`{"action":"jira.search","input":{"query":"error handling"}}`))
 	if result.Error != nil {
-		t.Fatalf("expected bun fixture mcp tool to succeed, got %v", result.Error)
+		t.Fatalf("expected support-bundle mcp tool to succeed, got %v", result.Error)
 	}
-	if len(result.LLMContent) == 0 || !strings.Contains(result.LLMContent[0].Text, "FHIR-53953") {
-		t.Fatalf("expected Jira fixture content in tool output, got %#v", result.LLMContent)
+	if len(result.LLMContent) == 0 || !strings.Contains(result.LLMContent[0].Text, "FHIR-20482") {
+		t.Fatalf("expected Jira search content in tool output, got %#v", result.LLMContent)
+	}
+
+	readResult := tool.Run(context.Background(), []byte(`{"action":"jira.read","input":{"key":"FHIR-20482"}}`))
+	if readResult.Error != nil {
+		t.Fatalf("expected jira.read to succeed, got %v", readResult.Error)
+	}
+	if len(readResult.LLMContent) == 0 || !strings.Contains(readResult.LLMContent[0].Text, `"key": "FHIR-20482"`) {
+		t.Fatalf("expected Jira read JSON in tool output, got %#v", readResult.LLMContent)
 	}
 }
 
@@ -219,7 +225,7 @@ func TestWorkspaceToolManagerProxyInvokesManagerEndpoint(t *testing.T) {
 
 	createWorkspaceTool(t, httpServer.URL, `{
 		"name":"hl7-jira",
-		"description":"Search realistic HL7 Jira fixture data",
+		"description":"Search and inspect issues from the real HL7 Jira SQLite snapshot",
 		"protocol":"mcp",
 		"transport":{
 			"type":"manager_proxy"
@@ -227,7 +233,7 @@ func TestWorkspaceToolManagerProxyInvokesManagerEndpoint(t *testing.T) {
 		"tools":[
 			{
 				"name":"jira.search",
-				"description":"Search realistic HL7 Jira issues related to validation and FHIRPath behavior",
+				"description":"Search HL7 Jira issues related to validation and FHIRPath behavior",
 				"inputSchema":{
 					"type":"object",
 					"properties":{"query":{"type":"string"}},
@@ -510,6 +516,68 @@ func workspaceRuntimeTool(t *testing.T, server *Server, topicName, toolName stri
 	}
 	t.Fatalf("workspace runtime tool %q not found in %#v", toolName, requestToolNames(&llm.Request{Tools: tools}))
 	return nil
+}
+
+func writeHL7JiraWorkspaceBundle(t *testing.T, workspaceRoot string) (string, string) {
+	t.Helper()
+
+	scriptSource, err := filepath.Abs(filepath.Join("..", "..", "test", "fixtures", "local-tools", "hl7-jira-support", "bin", "hl7-jira-mcp.js"))
+	if err != nil {
+		t.Fatalf("failed to resolve Jira support script: %v", err)
+	}
+	scriptData, err := os.ReadFile(scriptSource)
+	if err != nil {
+		t.Fatalf("failed to read Jira support script: %v", err)
+	}
+
+	scriptDir := filepath.Join(workspaceRoot, "tools", "hl7-jira-support", "bin")
+	dataDir := filepath.Join(workspaceRoot, "tools", "hl7-jira-support", "data")
+	if err := os.MkdirAll(scriptDir, 0o755); err != nil {
+		t.Fatalf("failed to create support script dir: %v", err)
+	}
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		t.Fatalf("failed to create support data dir: %v", err)
+	}
+
+	scriptPath := filepath.Join(scriptDir, "hl7-jira-mcp.js")
+	if err := os.WriteFile(scriptPath, scriptData, 0o755); err != nil {
+		t.Fatalf("failed to write Jira support script: %v", err)
+	}
+
+	dbPath := filepath.Join(dataDir, "jira-data.db")
+	writeHL7JiraTestDB(t, dbPath)
+
+	return "./tools/hl7-jira-support/bin/hl7-jira-mcp.js", "./tools/hl7-jira-support/data/jira-data.db"
+}
+
+func writeHL7JiraTestDB(t *testing.T, dbPath string) {
+	t.Helper()
+
+	sqlDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open Jira test db: %v", err)
+	}
+	defer sqlDB.Close()
+
+	if _, err := sqlDB.Exec(`
+		CREATE TABLE issues (
+			key TEXT PRIMARY KEY,
+			data JSON NOT NULL
+		);
+	`); err != nil {
+		t.Fatalf("create Jira issues table: %v", err)
+	}
+
+	records := []string{
+		`{"key":"FHIR-20482","summary":"FHIRPath conformsTo Validation of Warnings/Error handling pull request","description":"Validation error handling and warning propagation for FHIRPath evaluation.","comments_text":"Related to validation error handling and incorrect types.","status":"Applied","url":"https://jira.hl7.org/browse/FHIR-20482","related_artifacts":["FHIRPath"],"work_group":["FHIR Infrastructure"],"updated_at":"2025-12-03T10:15:00Z"}`,
+		`{"key":"FHIR-31991","summary":"Specify behavior for incorrect type returned by expressions","description":"Clarifies incorrect type handling in validation expressions.","comments_text":"Incorrect type returned by expressions should be consistent.","status":"Triaged","url":"https://jira.hl7.org/browse/FHIR-31991","related_artifacts":["FHIRPath"],"work_group":["FHIR Infrastructure"],"updated_at":"2025-11-12T09:00:00Z"}`,
+		`{"key":"FHIR-53946","summary":"Proposed New Mechanisms","description":"Discussion of possible new mechanisms related to validation behavior.","comments_text":"A broad thread touching validation semantics.","status":"Submitted","url":"https://jira.hl7.org/browse/FHIR-53946","related_artifacts":["Validator"],"work_group":["FHIR"],"updated_at":"2026-01-05T16:20:00Z"}`,
+	}
+	for _, record := range records {
+		if _, err := sqlDB.Exec(`INSERT INTO issues (key, data) VALUES (json_extract(?1, '$.key'), ?1)`, record); err != nil {
+			t.Fatalf("insert Jira test record: %v", err)
+		}
+	}
 }
 
 func topicHasToolResultText(t *testing.T, database *db.DB, conversationID, want string) bool {

@@ -328,7 +328,6 @@ func (t *Topic) drainPrompts() {
 		}
 
 		userData := workspacePromptUserData{
-			PromptID:    prompt.PromptID,
 			SubmittedBy: workspaceParticipantRef(prompt.SenderID),
 		}
 		if _, err := t.Manager.AcceptUserMessageWithMetadata(t.runtimeCtx, llmService, modelID, userMessage, userData, nil); err != nil {
@@ -536,9 +535,6 @@ func (t *Topic) InjectMessage(injectID, text, senderID string) (workspaceWSMessa
 	}
 
 	userData := workspacePromptUserData{
-		PromptID:    activePrompt.PromptID,
-		Injected:    true,
-		InjectID:    injectID,
 		SubmittedBy: workspaceParticipantRef(senderID),
 	}
 	message := llm.Message{
@@ -589,7 +585,6 @@ func (t *Topic) InterruptTurn(reason, senderID string) (workspaceWSMessage, erro
 	t.rememberPendingTurnStatus(activePrompt.PromptID, "interrupted")
 
 	doneMeta := workspaceDoneUserData{
-		PromptID:      activePrompt.PromptID,
 		Status:        "interrupted",
 		Reason:        reason,
 		InterruptedBy: workspaceParticipantRef(senderID),

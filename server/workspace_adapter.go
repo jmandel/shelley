@@ -1192,7 +1192,6 @@ func translateWorkspaceWSMessagesForAPIMessage(translator *workspaceTranslatorSt
 				translator.NoteToolCall(content.ID, content.ToolName)
 				messages = append(messages, workspaceWSMessage{
 					Type:       "tool_call",
-					PromptID:   translator.PromptIDForToolCall(content.ID),
 					ToolCallID: content.ID,
 					Title:      content.ToolName,
 					Kind:       toolKindFromName(content.ToolName),
@@ -1203,14 +1202,10 @@ func translateWorkspaceWSMessagesForAPIMessage(translator *workspaceTranslatorSt
 		}
 		if llmMsg.EndOfTurn {
 			done := workspaceWSMessage{
-				Type:     "done",
-				PromptID: translator.CurrentPromptID(),
-				Status:   "completed",
+				Type:   "done",
+				Status: "completed",
 			}
 			if hasDoneMeta {
-				if doneMeta.PromptID != "" {
-					done.PromptID = doneMeta.PromptID
-				}
 				if doneMeta.Status != "" {
 					done.Status = doneMeta.Status
 				}
@@ -1220,24 +1215,17 @@ func translateWorkspaceWSMessagesForAPIMessage(translator *workspaceTranslatorSt
 				done.Status = "cancelled"
 			}
 			messages = append(messages, done)
-			translator.FinishPrompt()
 			return messages, true
 		}
 	case string(dbpkg.MessageTypeUser):
 		promptMeta, hasPromptMeta := parseWorkspacePromptUserData(msg.UserData)
-		if hasPromptMeta && promptMeta.PromptID != "" {
-			translator.SetCurrentPromptID(promptMeta.PromptID)
-		}
 		for _, content := range llmMsg.Content {
 			switch content.Type {
 			case llm.ContentTypeText:
 				if content.Text != "" {
 					userMsg := workspaceWSMessage{Type: "user", Data: content.Text}
 					if hasPromptMeta {
-						userMsg.PromptID = promptMeta.PromptID
 						userMsg.SubmittedBy = promptMeta.SubmittedBy
-						userMsg.Injected = promptMeta.Injected
-						userMsg.InjectID = promptMeta.InjectID
 					}
 					messages = append(messages, userMsg)
 				}
@@ -1249,7 +1237,6 @@ func translateWorkspaceWSMessagesForAPIMessage(translator *workspaceTranslatorSt
 				title := translator.ToolTitle(content.ToolUseID)
 				messages = append(messages, workspaceWSMessage{
 					Type:       "tool_update",
-					PromptID:   translator.PromptIDForToolCall(content.ToolUseID),
 					ToolCallID: content.ToolUseID,
 					Title:      title,
 					Status:     status,
@@ -1269,7 +1256,6 @@ func translateWorkspaceWSMessagesForAPIMessage(translator *workspaceTranslatorSt
 			title := translator.ToolTitle(content.ToolUseID)
 			messages = append(messages, workspaceWSMessage{
 				Type:       "tool_update",
-				PromptID:   translator.PromptIDForToolCall(content.ToolUseID),
 				ToolCallID: content.ToolUseID,
 				Title:      title,
 				Status:     status,

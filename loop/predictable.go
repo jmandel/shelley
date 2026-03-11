@@ -93,15 +93,18 @@ Examples:
 - ws pause2 jira "blood pressure validator example errors"
 - ws validator "input/examples/Patient-bp-alice-smith.json input/examples/Observation-bp-alice-morning.json" toolpause3 aftertext "Validator finished."
 - ws tool hl7-jira action jira.search input '{"query":"validator error handling bad codes invalid dates"}'
+- ws tool hl7-jira action jira.read input '{"key":"FHIR-20482"}'
 
 Whole demo commands:
 1. Validator run that stays busy long enough to show queueing
    ws validator "input/examples/Patient-bp-alice-smith.json input/examples/Observation-bp-alice-morning.json" toolpause5 aftertext "The validator found bad patient demographics and a broken blood pressure example."
 2. A late-joining participant asks for related Jira issues
    ws jira "FHIR validator example errors invalid dates bad codes blood pressure" pause1
-3. Inspect the broken example resources from bash
+3. Read the full JSON for one matching Jira issue
+   ws tool hl7-jira action jira.read input '{"key":"FHIR-20482"}' aftertext "This issue shows the full stored Jira record."
+4. Inspect the broken example resources from bash
    ws bash "sed -n '1,200p' input/examples/Patient-bp-alice-smith.json && printf '\n---\n' && sed -n '1,240p' input/examples/Observation-bp-alice-morning.json"
-4. Simulate fixing both example resources from bash
+5. Simulate fixing both example resources from bash
    ws bash "python3 - <<'PY'
 import json
 from pathlib import Path
@@ -128,9 +131,9 @@ observation['component'] = [
 obs_path.write_text(json.dumps(observation, indent=2) + '\n')
 print('Updated both example resources.')
 PY"
-5. Re-run validation after the fix
+6. Re-run validation after the fix
    ws validator "input/examples/Patient-bp-alice-smith.json input/examples/Observation-bp-alice-morning.json" aftertext "The hard validator errors are gone. Only expected warnings remain without a terminology server."
-6. Short narration or handoff text
+7. Short narration or handoff text
    ws text "Marco, can you review the updated example resources before we publish the preview?"
 
 Rules:

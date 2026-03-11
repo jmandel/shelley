@@ -341,6 +341,52 @@ func TestPredictableServiceWSDemoJiraTaggedArgs(t *testing.T) {
 	}
 }
 
+func TestPredictableServiceWSDemoExplicitToolRead(t *testing.T) {
+	service := NewPredictableService()
+
+	resp, err := service.Do(context.Background(), &llm.Request{
+		Messages: []llm.Message{
+			{Role: llm.MessageRoleUser, Content: []llm.Content{{Type: llm.ContentTypeText, Text: `ws tool hl7-jira action jira.read input '{"key":"FHIR-20482"}'`}}},
+		},
+		Tools: []*llm.Tool{{Name: "workspace_hl7-jira"}},
+	})
+	if err != nil {
+		t.Fatalf("ws explicit tool read failed: %v", err)
+	}
+	if resp.StopReason != llm.StopReasonToolUse {
+		t.Fatalf("expected tool use stop reason, got %v", resp.StopReason)
+	}
+
+	var toolUse *llm.Content
+	for i := range resp.Content {
+		if resp.Content[i].Type == llm.ContentTypeToolUse {
+			toolUse = &resp.Content[i]
+			break
+		}
+	}
+	if toolUse == nil {
+		t.Fatal("expected workspace tool use")
+	}
+
+	var input struct {
+		Action string          `json:"action"`
+		Input  json.RawMessage `json:"input"`
+	}
+	if err := json.Unmarshal(toolUse.ToolInput, &input); err != nil {
+		t.Fatalf("failed to decode workspace tool input: %v", err)
+	}
+	if input.Action != "jira.read" {
+		t.Fatalf("expected jira.read action, got %q", input.Action)
+	}
+	var payload map[string]string
+	if err := json.Unmarshal(input.Input, &payload); err != nil {
+		t.Fatalf("failed to decode jira.read payload: %v", err)
+	}
+	if payload["key"] != "FHIR-20482" {
+		t.Fatalf("unexpected jira.read payload %#v", payload)
+	}
+}
+
 func TestPredictableServiceWSHelp(t *testing.T) {
 	service := NewPredictableService()
 
@@ -352,7 +398,7 @@ func TestPredictableServiceWSHelp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ws help failed: %v", err)
 	}
-	if got := resp.Content[0].Text; !strings.Contains(got, "Show this guide:") || !strings.Contains(got, "Syntax:") || !strings.Contains(got, "toolpause3") || !strings.Contains(got, "Whole demo commands:") || !strings.Contains(got, "The hard validator errors are gone.") {
+	if got := resp.Content[0].Text; !strings.Contains(got, "Show this guide:") || !strings.Contains(got, "Syntax:") || !strings.Contains(got, "toolpause3") || !strings.Contains(got, "jira.read") || !strings.Contains(got, "Whole demo commands:") || !strings.Contains(got, "The hard validator errors are gone.") {
 		t.Fatalf("unexpected ws help response %q", got)
 	}
 }
