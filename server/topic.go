@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -105,6 +107,10 @@ func (tm *TopicManager) GetOrCreateTopic(ctx context.Context, topicName string) 
 		Name:    topicName,
 		ModelID: modelID,
 	})
+	if err := topic.seedPromptSequence(ctx); err != nil {
+		topic.Close()
+		return nil, topicConversationExisting, err
+	}
 	topic.start()
 
 	tm.mu.Lock()
@@ -200,6 +206,42 @@ func newTopic(server *Server, manager *ConversationManager, conversation *genera
 func (t *Topic) start() {
 	go t.forwardStream()
 	go t.drainPrompts()
+}
+
+func (t *Topic) seedPromptSequence(ctx context.Context) error {
+	messages, err := t.server.db.ListMessages(ctx, t.Conversation.ConversationID)
+	if err != nil {
+		return err
+	}
+
+	var maxPromptSeq int64
+	for _, msg := range messages {
+		promptMeta, ok := parseWorkspacePromptUserData(msg.UserData)
+		if !ok {
+			continue
+		}
+		seq, ok := workspacePromptSequence(promptMeta.RunID, t.Conversation.ConversationID)
+		if ok && seq > maxPromptSeq {
+			maxPromptSeq = seq
+		}
+	}
+
+	t.metaMu.Lock()
+	t.promptSeq = maxPromptSeq
+	t.metaMu.Unlock()
+	return nil
+}
+
+func workspacePromptSequence(runID, conversationID string) (int64, bool) {
+	prefix := "p_" + conversationID + "_"
+	if !strings.HasPrefix(runID, prefix) {
+		return 0, false
+	}
+	seq, err := strconv.ParseInt(strings.TrimPrefix(runID, prefix), 10, 64)
+	if err != nil || seq < 0 {
+		return 0, false
+	}
+	return seq, true
 }
 
 func (t *Topic) Close() {

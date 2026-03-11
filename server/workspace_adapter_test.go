@@ -536,6 +536,93 @@ func TestWorkspaceTopicWSQueuesPrompt(t *testing.T) {
 	}
 }
 
+func TestWorkspaceTopicWSDeliversTranscriptBeforeCompletion(t *testing.T) {
+	server, _, _ := newTestServer(t)
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws/topics/ordered/events"
+	conn, _, err := websocket.Dial(ctx, wsURL, workspaceAuthDialOptions(t, "viewer"))
+	if err != nil {
+		t.Fatalf("failed to dial websocket: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "test complete")
+
+	waitForConnectedMessage(t, ctx, conn)
+
+	promptText := "echo: ordered"
+	if err := wsjson.Write(ctx, conn, workspacePromptMessage{Type: "prompt", Data: promptText}); err != nil {
+		t.Fatalf("failed to send prompt: %v", err)
+	}
+
+	labels := make([]string, 0, 4)
+	seen := make(map[string]bool)
+	runID := ""
+	for !(seen["running"] && seen["user"] && seen["assistant"] && seen["completed"]) {
+		msg := readWorkspaceWSMessage(t, ctx, conn)
+		switch msg.Type {
+		case "run_updated":
+			if msg.Text != promptText {
+				continue
+			}
+			if runID == "" {
+				runID = msg.RunID
+			}
+			if msg.RunID != runID {
+				continue
+			}
+			if msg.State == "running" && !seen["running"] {
+				seen["running"] = true
+				labels = append(labels, "running")
+			}
+			if msg.State == string(PromptStatusCompleted) && !seen["completed"] {
+				seen["completed"] = true
+				labels = append(labels, "completed")
+			}
+		case "message":
+			if msg.Text == promptText && msg.Role == "user" {
+				if runID == "" {
+					runID = msg.RunID
+				}
+				if msg.RunID == runID && !seen["user"] {
+					seen["user"] = true
+					labels = append(labels, "user")
+				}
+			}
+			if msg.Role == "assistant" {
+				if runID == "" {
+					runID = msg.RunID
+				}
+				if msg.RunID == runID && !seen["assistant"] {
+					seen["assistant"] = true
+					labels = append(labels, "assistant")
+				}
+			}
+		}
+	}
+
+	indexOf := func(label string) int {
+		for i, current := range labels {
+			if current == label {
+				return i
+			}
+		}
+		return -1
+	}
+
+	if indexOf("completed") < indexOf("user") {
+		t.Fatalf("completed arrived before user transcript: %#v", labels)
+	}
+	if indexOf("completed") < indexOf("assistant") {
+		t.Fatalf("completed arrived before assistant transcript: %#v", labels)
+	}
+}
+
 func TestWorkspaceTopicIgnoresOtherConversationStateUpdates(t *testing.T) {
 	t.Setenv("PREDICTABLE_DELAY_MS", "500")
 
@@ -898,9 +985,9 @@ func TestWorkspaceTopicPromptPositionFront(t *testing.T) {
 	thirdPromptID := sendWorkspacePromptAndWaitAccepted(t, ctx, conn, "echo: third", &front)
 
 	var (
-		thirdQueued bool
+		thirdQueued   bool
 		completedRuns []string
-		eventLog    []workspaceWSMessage
+		eventLog      []workspaceWSMessage
 	)
 
 	for len(completedRuns) < 3 {
@@ -989,25 +1076,37 @@ func TestWorkspaceTopicInjectDuringActiveTurn(t *testing.T) {
 	}
 
 	var (
-		acceptedSeen   bool
-		injectedSeen   bool
-		textSeen       bool
-		completedSeen  bool
-		activeRunID    string
+		acceptedSeen  bool
+		injectedSeen  bool
+		textSeen      bool
+		completedSeen bool
+		activeRunID   string
+		eventLog      []workspaceWSMessage
 	)
-
-	for !(acceptedSeen && injectedSeen && textSeen && completedSeen) {
-		msg := readWorkspaceWSMessage(t, ctx, conn)
+	deadline := time.Now().Add(5 * time.Second)
+	for !(acceptedSeen && injectedSeen && textSeen && completedSeen) && time.Now().Before(deadline) {
+		msg, err := readWorkspaceWSMessageBefore(ctx, conn, deadline)
+		if err != nil {
+			break
+		}
+		eventLog = append(eventLog, msg)
 		switch msg.Type {
 		case "inject_status":
 			if msg.Status == "accepted" {
 				if msg.InjectID == "" {
 					t.Fatal("expected server-assigned injectId on accepted inject_status")
 				}
-				activeRunID = msg.RunID
+				if activeRunID == "" {
+					activeRunID = msg.RunID
+				}
 				acceptedSeen = true
 			}
 		case "message":
+			if msg.Role == "user" && msg.Text == `ws text "Injected guidance acknowledged."` {
+				if activeRunID == "" {
+					activeRunID = msg.RunID
+				}
+			}
 			if msg.Role == "user" && msg.RunID == activeRunID && msg.Text == `ws text "Injected guidance acknowledged."` {
 				injectedSeen = true
 			}
@@ -1019,6 +1118,9 @@ func TestWorkspaceTopicInjectDuringActiveTurn(t *testing.T) {
 				completedSeen = true
 			}
 		}
+	}
+	if !(acceptedSeen && injectedSeen && textSeen && completedSeen) {
+		t.Fatalf("expected accepted inject, injected transcript, assistant reply, and completed run; got accepted=%v injected=%v text=%v completed=%v events=%#v", acceptedSeen, injectedSeen, textSeen, completedSeen, eventLog)
 	}
 
 	waitFor(t, 2*time.Second, func() bool {
@@ -1177,6 +1279,7 @@ func TestWorkspaceTopicInjectDoesNotAckBeforePersistence(t *testing.T) {
 
 func TestWorkspaceTopicInterruptRESTAndQueueDrain(t *testing.T) {
 	server, _, predictable := newTestServer(t)
+	database := server.db
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
 	httpServer := httptest.NewServer(mux)
@@ -1194,6 +1297,7 @@ func TestWorkspaceTopicInterruptRESTAndQueueDrain(t *testing.T) {
 
 	firstPromptID := sendWorkspacePromptAndWaitAccepted(t, ctx, conn, `ws bash "printf slow" toolpause0.2 aftertext "Primary turn complete."`, nil)
 	secondPromptID := sendWorkspacePromptAndWaitAccepted(t, ctx, conn, "echo: second", nil)
+	conversationID := conversationIDForTopic(t, database, "interrupt-rest")
 
 	for {
 		msg := readWorkspaceWSMessage(t, ctx, conn)
@@ -1227,13 +1331,18 @@ func TestWorkspaceTopicInterruptRESTAndQueueDrain(t *testing.T) {
 	}
 
 	var (
-		cancelledSeen   bool
-		secondStarted   bool
-		secondDone      bool
+		cancelledSeen bool
+		secondStarted bool
+		secondDone    bool
+		eventLog      []workspaceWSMessage
 	)
-
-	for !secondDone {
-		msg := readWorkspaceWSMessage(t, ctx, conn)
+	deadline := time.Now().Add(5 * time.Second)
+	for !secondDone && time.Now().Before(deadline) {
+		msg, err := readWorkspaceWSMessageBefore(ctx, conn, deadline)
+		if err != nil {
+			break
+		}
+		eventLog = append(eventLog, msg)
 		switch msg.Type {
 		case "run_updated":
 			if msg.RunID == firstPromptID && msg.State == string(PromptStatusCancelled) {
@@ -1246,6 +1355,9 @@ func TestWorkspaceTopicInterruptRESTAndQueueDrain(t *testing.T) {
 				secondDone = true
 			}
 		}
+	}
+	if !secondDone {
+		t.Fatalf("expected interrupt to cancel first run and drain queued work; got cancelled=%v secondStarted=%v secondDone=%v requests=%d events=%#v db=%#v", cancelledSeen, secondStarted, secondDone, len(predictable.GetRecentRequests()), eventLog, debugConversationMessages(t, database, conversationID))
 	}
 
 	if !cancelledSeen {
@@ -1715,6 +1827,120 @@ func TestWorkspaceTopicAPIChatRestoresRuntimeFromPersistedTopic(t *testing.T) {
 	}
 }
 
+func TestWorkspaceTopicRestoredRuntimeSeedsPromptIDsFromHistory(t *testing.T) {
+	server, database, _ := newTestServer(t)
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws/topics/restored-sequence/events"
+	conn, _, err := websocket.Dial(ctx, wsURL, workspaceAuthDialOptions(t, "viewer"))
+	if err != nil {
+		t.Fatalf("failed to dial websocket: %v", err)
+	}
+	waitForConnectedMessage(t, ctx, conn)
+	firstRunID := sendWorkspacePromptAndWaitAccepted(t, ctx, conn, "echo: first", nil)
+	for {
+		msg := readWorkspaceWSMessage(t, ctx, conn)
+		if msg.Type == "run_updated" && msg.RunID == firstRunID && msg.State == string(PromptStatusCompleted) {
+			break
+		}
+	}
+	conn.Close(websocket.StatusNormalClosure, "first run complete")
+
+	predictable := loop.NewPredictableService()
+	restarted := NewServer(
+		database,
+		&testLLMManager{service: predictable},
+		claudetool.ToolSetConfig{EnableBrowser: false},
+		slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelWarn})),
+		true,
+		"",
+		"predictable",
+		"",
+		nil,
+	)
+	restartedMux := http.NewServeMux()
+	restarted.RegisterRoutes(restartedMux)
+	restartedHTTP := httptest.NewServer(restartedMux)
+	defer restartedHTTP.Close()
+
+	restartedConn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(restartedHTTP.URL, "http")+"/ws/topics/restored-sequence/events", workspaceAuthDialOptions(t, "viewer"))
+	if err != nil {
+		t.Fatalf("failed to dial restarted websocket: %v", err)
+	}
+	defer restartedConn.Close(websocket.StatusNormalClosure, "test complete")
+	waitForConnectedMessage(t, ctx, restartedConn)
+
+	if err := wsjson.Write(ctx, restartedConn, workspacePromptMessage{Type: "prompt", Data: "echo: second"}); err != nil {
+		t.Fatalf("failed to send restored prompt: %v", err)
+	}
+
+	var (
+		secondRunID   string
+		assistantSeen bool
+		completedSeen bool
+	)
+	for !(assistantSeen && completedSeen) {
+		msg := readWorkspaceWSMessage(t, ctx, restartedConn)
+		switch msg.Type {
+		case "run_updated":
+			if msg.Text != "echo: second" {
+				continue
+			}
+			if secondRunID == "" {
+				secondRunID = msg.RunID
+			}
+			if msg.RunID == secondRunID && msg.State == string(PromptStatusCompleted) {
+				completedSeen = true
+			}
+		case "message":
+			if msg.RunID == secondRunID && msg.Role == "assistant" {
+				assistantSeen = true
+			}
+		}
+	}
+
+	if firstRunID == secondRunID {
+		t.Fatalf("expected restored runtime to advance prompt ids, got reused runId %q", secondRunID)
+	}
+	if secondRunID == "" {
+		t.Fatal("expected restored prompt to receive a runId")
+	}
+}
+
+func debugConversationMessages(t *testing.T, database *dbpkg.DB, conversationID string) []map[string]any {
+	t.Helper()
+
+	messages, err := database.ListMessages(context.Background(), conversationID)
+	if err != nil {
+		return []map[string]any{{"error": err.Error()}}
+	}
+
+	out := make([]map[string]any, 0, len(messages))
+	for _, msg := range messages {
+		entry := map[string]any{
+			"sequenceID": msg.SequenceID,
+			"type":       msg.Type,
+		}
+		if msg.UserData != nil {
+			entry["userData"] = *msg.UserData
+		}
+		if msg.DisplayData != nil {
+			entry["displayData"] = *msg.DisplayData
+		}
+		if msg.LlmData != nil {
+			entry["llmData"] = *msg.LlmData
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
 func TestRenameTopicConversationKeepsWorkspaceTopicRouting(t *testing.T) {
 	server, database, _ := newTestServer(t)
 	mux := http.NewServeMux()
@@ -1942,14 +2168,37 @@ func conversationIDForTopic(t *testing.T, database *dbpkg.DB, topicName string) 
 
 func readWorkspaceWSMessage(t *testing.T, ctx context.Context, conn *websocket.Conn) workspaceWSMessage {
 	t.Helper()
+	msg, err := readWorkspaceWSMessageErr(ctx, conn)
+	if err != nil {
+		t.Fatalf("failed to read websocket message: %v", err)
+	}
+	return msg
+}
+
+func readWorkspaceWSMessageErr(ctx context.Context, conn *websocket.Conn) (workspaceWSMessage, error) {
 	readCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
 	var msg workspaceWSMessage
 	if err := wsjson.Read(readCtx, conn, &msg); err != nil {
-		t.Fatalf("failed to read websocket message: %v", err)
+		return workspaceWSMessage{}, err
 	}
-	return msg
+	return msg, nil
+}
+
+func readWorkspaceWSMessageBefore(ctx context.Context, conn *websocket.Conn, deadline time.Time) (workspaceWSMessage, error) {
+	timeout := time.Until(deadline)
+	if timeout <= 0 {
+		return workspaceWSMessage{}, context.DeadlineExceeded
+	}
+	readCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	var msg workspaceWSMessage
+	if err := wsjson.Read(readCtx, conn, &msg); err != nil {
+		return workspaceWSMessage{}, err
+	}
+	return msg, nil
 }
 
 func getWorkspaceTopicInfo(t *testing.T, url string) workspaceTopicInfo {

@@ -732,6 +732,20 @@ func (cm *ConversationManager) cancelConversation(ctx context.Context, userData 
 		}
 	}
 
+	// Detach the canceled loop before publishing cancellation messages so any
+	// follow-on prompt starts a fresh loop instead of racing onto the old one.
+	cm.mu.Lock()
+	if cm.loop == loopInstance {
+		cm.loopCancel = nil
+		cm.loopCtx = nil
+		cm.loop = nil
+		cm.modelID = ""
+		// Force the next prompt to rehydrate from the canonical DB transcript,
+		// including the cancellation messages written below.
+		cm.hydrated = false
+	}
+	cm.mu.Unlock()
+
 	// Record cancellation messages
 	if inProgressToolID != "" {
 		// If there was an in-progress tool, record a cancelled result
@@ -783,15 +797,6 @@ func (cm *ConversationManager) cancelConversation(ctx context.Context, userData 
 
 	// Mark agent as not working
 	cm.SetAgentWorking(false)
-
-	cm.mu.Lock()
-	cm.loopCancel = nil
-	cm.loopCtx = nil
-	cm.loop = nil
-	cm.modelID = ""
-	// Reset hydrated so that the next AcceptUserMessage will reload history from the database
-	cm.hydrated = false
-	cm.mu.Unlock()
 
 	return nil
 }

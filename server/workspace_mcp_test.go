@@ -444,9 +444,13 @@ func TestWorkspaceToolMCPApprovalExecutesAfterApproval(t *testing.T) {
 
 	var (
 		approvalRequest workspaceWSMessage
+		toolCalled      bool
 	)
 	for {
 		msg := readWorkspaceWSMessage(t, ctx, conn)
+		if msg.Type == "tool_call" && msg.Title == "workspace_approval-greeter" {
+			toolCalled = true
+		}
 		if msg.Type == "approval_request" {
 			approvalRequest = msg
 			break
@@ -465,16 +469,12 @@ func TestWorkspaceToolMCPApprovalExecutesAfterApproval(t *testing.T) {
 		t.Fatalf("failed to send approval response: %v", err)
 	}
 
-	var toolCalled bool
 	var toolUpdated bool
 	var runCompleted bool
 	var received []workspaceWSMessage
 	for {
 		msg := readWorkspaceWSMessage(t, ctx, conn)
 		received = append(received, msg)
-		if msg.Type == "tool_call" && msg.Title == "workspace_approval-greeter" {
-			toolCalled = true
-		}
 		if msg.Type == "tool_update" && msg.Title == "workspace_approval-greeter" && msg.Status == "completed" {
 			toolUpdated = true
 		}

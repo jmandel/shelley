@@ -912,10 +912,9 @@ func (s *Server) recordMessage(ctx context.Context, conversationID string, messa
 	}
 	s.mu.Unlock()
 
-	// Notify subscribers with only the new message - use WithoutCancel because
-	// the HTTP request context may be cancelled after the handler returns, but
-	// we still want the notification to complete so SSE clients see the message immediately
-	go s.notifySubscribersNewMessage(context.WithoutCancel(ctx), conversationID, createdMsg)
+	// Notify subscribers synchronously so sequence ordering is preserved across
+	// user, tool, and assistant messages for a conversation turn.
+	s.notifySubscribersNewMessage(context.WithoutCancel(ctx), conversationID, createdMsg)
 
 	return nil
 }

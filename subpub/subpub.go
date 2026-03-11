@@ -31,8 +31,8 @@ func (sp *SubPub[K]) Subscribe(ctx context.Context, idx int64) func() (K, bool) 
 	// Create a child context so we can cancel the subscription independently
 	subCtx, cancel := context.WithCancel(ctx)
 
-	// Buffered channel to avoid blocking publishers
-	ch := make(chan K, 10)
+	// Buffered channel to absorb short bursts while preserving ordering.
+	ch := make(chan K, 64)
 	sub := &subscriber[K]{
 		idx:    idx,
 		ch:     ch,
