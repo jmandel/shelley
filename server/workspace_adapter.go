@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/coder/websocket"
@@ -309,6 +310,7 @@ func (s *Server) handleWorkspaceTopicWSForName(w http.ResponseWriter, r *http.Re
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+	var closeOnce sync.Once
 
 	outCh := make(chan workspaceWSMessage, 64)
 	go s.workspaceTopicWriter(ctx, cancel, conn, outCh)
@@ -327,7 +329,11 @@ func (s *Server) handleWorkspaceTopicWSForName(w http.ResponseWriter, r *http.Re
 
 	connectionID := fmt.Sprintf("%s-%d", topicName, time.Now().UnixNano())
 	submittedBy := workspaceSubjectFromPrincipal(principal)
-	topic.WSHub.Add(connectionID, outCh, cancel)
+	topic.WSHub.Add(connectionID, outCh, cancel, func(code websocket.StatusCode, reason string) {
+		closeOnce.Do(func() {
+			_ = conn.Close(code, reason)
+		})
+	})
 	defer topic.WSHub.Remove(connectionID)
 
 	topic.sendWSMessage(ctx, outCh, workspaceWSMessage{

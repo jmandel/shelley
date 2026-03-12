@@ -3,11 +3,14 @@ package server
 import (
 	"context"
 	"sync"
+
+	"github.com/coder/websocket"
 )
 
 type wsHubClient struct {
-	outCh  chan<- workspaceWSMessage
-	cancel context.CancelFunc
+	outCh     chan<- workspaceWSMessage
+	cancel    context.CancelFunc
+	closeConn func(websocket.StatusCode, string)
 }
 
 type WSHub struct {
@@ -21,12 +24,13 @@ func NewWSHub() *WSHub {
 	}
 }
 
-func (h *WSHub) Add(id string, outCh chan<- workspaceWSMessage, cancel context.CancelFunc) {
+func (h *WSHub) Add(id string, outCh chan<- workspaceWSMessage, cancel context.CancelFunc, closeConn func(websocket.StatusCode, string)) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.clients[id] = &wsHubClient{
-		outCh:  outCh,
-		cancel: cancel,
+		outCh:     outCh,
+		cancel:    cancel,
+		closeConn: closeConn,
 	}
 }
 
@@ -56,6 +60,9 @@ func (h *WSHub) Broadcast(msg workspaceWSMessage) {
 	h.mu.Unlock()
 
 	for _, client := range stale {
+		if client.closeConn != nil {
+			client.closeConn(websocket.StatusTryAgainLater, "outbound queue full")
+		}
 		client.cancel()
 	}
 }

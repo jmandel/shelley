@@ -392,6 +392,9 @@ func (t *Topic) drainPrompts() {
 			t.broadcastWSMessage(workspaceWSMessage{Type: "error", Data: err.Error()})
 			continue
 		}
+		// AcceptUserMessageWithMetadata flips the manager into its real working state.
+		// Broadcast again so all tabs see the run become interruptible consistently.
+		t.broadcastTopicState("run_accepted")
 
 		if !t.waitForTurnEnd(waitCh) {
 			return
